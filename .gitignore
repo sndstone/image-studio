@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.dmg
+.signing/
+# Benchmark grids and screenshots made from local reference photos stay out of the repo.
+test-results/

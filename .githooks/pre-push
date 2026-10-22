@@ -1,0 +1,3 @@
+#!/bin/bash
+# Runs local CI before anything leaves this machine. Skip once with: git push --no-verify
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh"
