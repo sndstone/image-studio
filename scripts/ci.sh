@@ -3,6 +3,8 @@
 # Checks: shell syntax, backend unit tests, Swift build without warnings, privacy scan of tracked files.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# /usr/bin/git points hooks at the Command Line Tools SDK, where swiftc from Xcode can't find SwiftUI's macros.
+unset SDKROOT
 
 step() { printf '\n== %s\n' "$1"; }
 
