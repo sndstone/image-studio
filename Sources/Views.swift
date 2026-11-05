@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import UserNotifications
 
 @main
 struct ImageStudioApp: App {
@@ -62,6 +63,9 @@ struct ImageStudioApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }

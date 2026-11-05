@@ -2,6 +2,16 @@
 
 Versioning: `x.y.0` for feature releases, `x.y.z` (z ≥ 1) for minor fixes.
 
+## 0.4.0
+
+- A notification when generating finishes while you're in another app: one for a whole queue, saying how many images
+  are ready and whether anything failed. Clicking it opens the last image. Settings → General turns it off.
+- ⌘-scroll and pinch no longer change a result's zoom while another app is in front. macOS sends scrolling to the
+  window under the pointer, so a gesture meant for another app could leave an image at a stray zoom such as 6% or 221%.
+
+Not yet tested against the live APIs: the GPT Image GIF, SVG and markup options (GIF output also needs OpenAI's GIF
+preview access) and reference-image edits on the cloud models. Plain text-to-image was tested live on all three providers.
+
 ## 0.3.0
 
 - Cloud models in the model picker and Model Manager, next to the local ones: Google Nano Banana 2.1, 2, Pro and

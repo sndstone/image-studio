@@ -250,14 +250,17 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func magnify(with event: NSEvent) {
+        guard NSApp.isActive else { return }
         let base = pendingZoom?.scale ?? magnification
         let point = contentView.convert(event.locationInWindow, from: nil)
         zoom?.set(base * (1 + event.magnification), centeredAt: point)
     }
 
-    /// ⌘-scroll zooms toward the pointer; plain scrolling pans.
+    /// ⌘-scroll zooms toward the pointer; plain scrolling pans. Scrolling reaches the window under the pointer
+    /// even while another app is in front, so zooming waits until this one is: a gesture meant for that app
+    /// would otherwise change this image's zoom without anyone noticing.
     override func scrollWheel(with event: NSEvent) {
-        guard event.modifierFlags.contains(.command), let zoom else { return super.scrollWheel(with: event) }
+        guard event.modifierFlags.contains(.command), NSApp.isActive, let zoom else { return super.scrollWheel(with: event) }
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 100 : event.scrollingDeltaY / 10
         guard delta != 0 else { return }
         let point = contentView.convert(event.locationInWindow, from: nil)

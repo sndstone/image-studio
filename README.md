@@ -65,6 +65,8 @@ Backend modules: `catalog.py` (model list + mflux pipeline adapters), `downloads
 - **Zoom** the result: pinch, ⌘-scroll, double-click (fit ↔ 100%), ⌘= / ⌘- / ⌘0 (actual size) / ⌘9 (fit), or
   the controls at the bottom right; drag to pan.
 - **Idle unload**: frees the model's memory after 10 idle minutes (Settings).
+- **Finish notification**: when a job or the whole queue ends while you're in another app, a notification says how many
+  images are ready and whether anything failed; clicking it opens the last image. Turn it off in Settings.
 - **Clean Up Storage…** in the Model Manager: unfinished downloads, outdated conversions, caches, logs, and
   Hugging Face models no Image Studio entry uses (unchecked by default; other apps may use them).
 

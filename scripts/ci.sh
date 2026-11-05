@@ -25,6 +25,11 @@ swiftc -swift-version 5 -warnings-as-errors \
   -o "$OUT/ImageExportsTests" Sources/ImageExports.swift Sources/MediaFormats.swift tests/swift/ImageExportsTests.swift
 "$OUT/ImageExportsTests"
 
+step "Finish notification wording"
+swiftc -swift-version 5 -warnings-as-errors -parse-as-library \
+  -o "$OUT/FinishedRunTests" Sources/FinishedRun.swift tests/swift/FinishedRunTests.swift
+"$OUT/FinishedRunTests"
+
 step "Privacy scan"
 # Generic patterns: home-folder paths, private IPv4 addresses, mDNS hostnames, tokens and keys.
 # Personal names, hostnames or file names go in .git/info/private-patterns (one extended regex

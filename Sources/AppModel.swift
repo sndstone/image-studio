@@ -292,6 +292,14 @@ final class AppModel: ObservableObject {
             }
         }
     }
+    @Published var notifyWhenFinished = UserDefaults.standard.object(forKey: "notifyWhenFinished") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(notifyWhenFinished, forKey: "notifyWhenFinished")
+            prepareNotifications()
+        }
+    }
+    @Published var notificationsBlocked = false  // turned off for this app in System Settings
+    var finishedRun: FinishedRun?  // what the queue has done since it last went idle
     var activeCompareGroup: UUID?
     var lastPreviewID: Int?
     var applyingPreviewStatus = false
@@ -645,6 +653,11 @@ final class AppModel: ObservableObject {
         restoringQueue = false
         persistQueue()
         isGenerating = true
+        if finishedRun == nil {
+            finishedRun = FinishedRun()
+            prepareNotifications()
+        }
+        finishedRun?.jobNames.append(finishName(for: job))
         jobCancelRequested = false
         errorMessage = nil
         if previewImage != nil { previewImage = nil }
@@ -654,6 +667,7 @@ final class AppModel: ObservableObject {
         updateActivity()
         if pollTask != nil { startPolling() }
         jobTask = Task {
+            let failuresBefore = failedJobs.count
             do {
                 let items: [HistoryItem]
                 switch job.kind {
@@ -690,12 +704,14 @@ final class AppModel: ObservableObject {
                     items = [HistoryItem(url: URL(fileURLWithPath: path), seed: seed, seconds: result.seconds)]
                 }
                 acceptResults(items, job: job)
+                finishedRun?.images += items.map(\.url)
             } catch {
                 if !Task.isCancelled && !(error is CancellationError) {
                     errorMessage = error.localizedDescription
                     failedJobs.append(FailedJob(job: job, error: error.localizedDescription))
                 }
             }
+            finishedRun?.recordFailures(failedJobs.count - failuresBefore, error: errorMessage)
             finishPendingItems()
             isGenerating = false
             currentJob = nil
@@ -705,6 +721,7 @@ final class AppModel: ObservableObject {
             await refreshModels()
             runNextJob()
             updateActivity()
+            if !isGenerating { announceFinishedRun() }
         }
     }
 

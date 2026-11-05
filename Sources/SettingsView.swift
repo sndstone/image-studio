@@ -60,6 +60,23 @@ struct GeneralSettingsView: View {
             }
 
             Section {
+                Toggle("Send a notification", isOn: $model.notifyWhenFinished)
+                if model.notifyWhenFinished && model.notificationsBlocked {
+                    HStack {
+                        Text("Notifications are off for Image Studio.").font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open System Settings…") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") { NSWorkspace.shared.open(url) }
+                        }
+                    }
+                }
+            } header: {
+                Text("When finished")
+            } footer: {
+                SettingsNote("Only while you're in another app. A queue sends one notification at the end, and it says if any job failed. Prompts aren't shown in it.")
+            }
+
+            Section {
                 Toggle("Embed prompt and settings", isOn: $model.embedMetadata)
             } header: {
                 Text("Saved images")
@@ -77,6 +94,7 @@ struct GeneralSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 520, height: 590)
+        .task { await model.refreshNotificationStatus() }
     }
 
     /// The engine's live figure rather than a fixed range, since it differs per model and precision.
