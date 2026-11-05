@@ -1,8 +1,9 @@
 # Image Studio
 
-Local image generation and editing for Apple Silicon, using FLUX.2 klein, Qwen-Image 2.1,
+Local image generation and editing for Apple Silicon, using FLUX.3 klein, FLUX.2 klein, Qwen-Image 2.1,
 Z-Image Turbo, Krea 2 and SeedVR2 through [mflux](https://github.com/mflux-community/mflux) (MLX).
-Generation and editing run on your Mac.
+Generation and editing run on your Mac. Optional cloud models (Google Nano Banana, OpenAI GPT Image, the FLUX API)
+sit next to them when you add your own API keys.
 
 - Prompt → image (text-to-image)
 - Prompt + 1…N reference images → edit / combine ("put the cat from image 1 on the sofa in image 2")
@@ -38,6 +39,7 @@ models, or add a custom checkpoint (Hugging Face repo or local folder, e.g. from
 
 | Model | Released | Notes |
 | --- | --- | --- |
+| FLUX.3 klein (INT4 / INT8 / BF16) | Oct 2026 | 5.6B, 16 steps, edits with up to 10 images or starts from image 1, FLUX Kommunity license. Three separate downloads from mflux-community: INT4 (5.3 GB, ~11 GB memory), INT8 (9.9 GB, ~16 GB) or BF16 (18.5 GB, ~24 GB, can be quantized to 8/4-bit at load); download only the one you need |
 | FLUX.2 klein 4B (default) | Jan 2026 | 4 steps, multi-reference edit, Apache 2.0, ~6 s/image |
 | FLUX.2 klein Base 4B | Jan 2026 | 25 steps by default, Apache 2.0 |
 | FLUX.2 klein 9B | Jan 2026 | gated (token + license), non-commercial |
@@ -94,14 +96,68 @@ bf16 converted copy. Outdated optimized copies are also listed for cleanup.
   for Qwen (brush or "Only change…"), several LoRAs, variations and sweeps, persistent queue with pause/retry,
   before/after wipe, history search and favorites, settings inspector, export (PNG/JPEG/HEIC/WebP), offline mode.
 
+## Cloud models
+
+Next to the local models, the model picker has a **Cloud** section. Add keys in **Settings → Cloud**:
+
+| Provider | Models | Get a key |
+| --- | --- | --- |
+| Google | Nano Banana 2.1, 2, Pro, 2 Lite | [AI Studio](https://aistudio.google.com/apikey) |
+| OpenAI | GPT Image 2.6 and 2.5 (Sunburst, Flare), GPT Image 2 | [API keys](https://platform.openai.com/api-keys) |
+| Black Forest Labs | FLUX.3 Image, FLUX.3 klein, FLUX.2 max, pro, flex, klein | [Dashboard](https://dashboard.bfl.ai) |
+
+**Save & Test** checks a key with a free, read-only call. **Test Image (billed)** generates one small image with
+the provider's cheapest model, which also catches missing billing, quota or OpenAI organization verification.
+
+With an OpenAI model selected, the Generation section adds what GPT Image offers, with options a model lacks shown
+locked:
+
+| Option | Models | Notes |
+|---|---|---|
+| **Output: GIF** | 2.6 | 2–16 frames, 20–2000 ms per frame. Playback in the viewer; OpenAI can choose the frame size, since all the frames share a pixel budget |
+| **Output: SVG** | 2.6 | Vector shapes for icons and illustrations. Its cost isn't shown: it includes a drawing model whose price isn't published |
+| **Quality** | All; Extra high and Max on 2.5 and 2.6 | Changes the price a lot |
+| **Complexity** | 2.6 | How much the model plans before rendering; no extra fee |
+| **Draw Markup…** | 2.5 and 2.6 | Under Reference images: sketch on image 1 to show where a change goes |
+
+GIF and SVG can't use reference images. An SVG can't be edited or upscaled, a GIF can't be upscaled, and editing a GIF
+uses its first frame. **Export…** can save the original file or a still copy.
+
+Results land in the same history as local images. Each image is one request, so Cancel stops the batch, though a
+request already sent may still be charged. Variations work too, and bill per image. A failed batch retries only the
+images it didn't get.
+
+### Compare models
+
+**Compare…** (⇧⌘C) runs one prompt on any local and cloud models and shows the results side by side with their time
+and cost. Cloud models run first, at the same time. Local models take turns, since they share one GPU and running them
+together wouldn't finish sooner: if the next model fits in free memory (leaving 4 GB for other apps) the previous one
+stays loaded, so switching back is instant; otherwise it's unloaded first.
+
+### Costs
+
+**Costs** (⇧⌘K or the toolbar's $ button) has a **Dashboard** (today, this month, all time, the last 30 days by
+provider, spending by model, the BFL balance), **Images** (each image's cost and where the figure came from) and
+**Prices**. The cost also shows beside each image. Figures come from Black Forest Labs' reported cost per job, or
+from the tokens in the response at Google's and OpenAI's published rates (checked 2026-11-05, kept in
+`backend/costs.py`). The ledger is `cloud-costs.jsonl` in the app's support folder.
+
+Costs covers only the images still in your library. Moving an image to the Trash, or removing it in Finder, removes
+its entry from the ledger and every total, along with its favorite and any cached reference copies; restoring it from
+the Trash doesn't bring the entry back, though the image still shows its own cost. Test images and requests cancelled
+or failed in flight have no entry. So **these totals aren't your spending: only the provider's bill shows that.**
+
 ## Privacy
 
 Setup accesses Python/package sources (and Homebrew or GitHub if uv needs installing). Model downloads,
-file manifests and token checks contact Hugging Face. No other app network use is intended; prompts,
-reference images and generated images stay local. Offline mode disables Hugging Face downloads.
+file manifests and token checks contact Hugging Face. With local models, prompts, reference images and
+generated images stay on this Mac. **Cloud models are the exception:** when you pick one, the prompt and
+reference images (re-encoded as JPEG, so without EXIF) go to that provider under its terms, and your account
+is billed. Without an API key nothing is sent. Offline mode disables Hugging Face downloads and cloud models.
 PNG prompt/path metadata is off by default; enable it in Settings if wanted. Settings still accompany
 results in local JSON sidecars. A saved Hugging Face token is stored in the macOS Keychain item
-service `local.imagestudio`, account `huggingface-token`.
+service `local.imagestudio`, account `huggingface-token`; cloud API keys are in the same service, account
+`cloud-api-keys`. The engine holds keys in memory only, and sends each one only to its own provider.
 
 ## Rebuild
 

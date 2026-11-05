@@ -19,6 +19,34 @@ struct EngineSettings: Codable {
     var offline: Bool
 }
 
+struct CloudTestResult: Decodable {
+    var ok: Bool
+    var message: String
+    var thumbnail: String?  // base64 JPEG from a test image
+    var credits: Double?  // BFL's balance, from a key check
+}
+
+struct CloudBatchResult: Decodable {
+    var model: String
+    var images: [GeneratedImageInfo]
+    var error: String?
+}
+
+struct CloudBatchResponse: Decodable {
+    var results: [CloudBatchResult]
+    var images: [GeneratedImageInfo]  // in the order they finished, matching what the status showed
+    var cancelled: Bool
+}
+
+/// How a comparison would run, shown before it starts.
+struct ComparePlan: Decodable, Equatable {
+    var cloud_models: Int
+    var local_models: Int
+    var keep_loaded: Bool
+    var cost_usd: Double
+    var costs_unknown: Int
+}
+
 struct GenerateRequest: Codable, Hashable {
     var prompt: String
     var negative_prompt: String?
@@ -40,6 +68,15 @@ struct GenerateRequest: Codable, Hashable {
     var auto_mask: String? = nil
     var enhance_prompt: Bool? = nil
     var loras: [LoraSetting]? = nil
+    var keep_loaded: Bool? = nil
+    // GPT Image
+    var quality: String? = nil
+    var complexity: String? = nil
+    var output_format: String? = nil
+    var frame_count: Int? = nil
+    var frame_duration_ms: Int? = nil
+    var gif_auto_size: Bool? = nil
+    var markup_path: String? = nil
 }
 
 /// Expected duration learned from earlier runs on this Mac.
@@ -49,6 +86,8 @@ struct Estimate: Decodable, Equatable {
     var basis: String  // measured | similar (other kind of run, same model) | none
     var steps_run: Int
     var passes: Int
+    var cost_usd: Double? = nil  // cloud models: one image
+    var cost_basis: String? = nil  // list | history | none
 }
 
 struct StorageItem: Decodable, Identifiable, Hashable {
@@ -156,6 +195,11 @@ struct ModelInfo: Decodable, Identifiable, Hashable {
     var loaded: Bool
     var loaded_quant: Int?
     var tool: Bool?  // the upscaler: downloadable, but not an image generator
+    var stored_quant: Int?  // the download is already quantized at this precision
+    var group: String?  // versions of one model share a Model Manager card
+    var group_description: String?
+    var variant: String?  // this version's label within its group (e.g. "INT8")
+    var group_missing_bytes: Int?  // the group's versions not downloaded yet, shared files once (nil: unknown)
 
     var max_megapixels: Double?
     var supports_step_cache: Bool?
@@ -164,7 +208,14 @@ struct ModelInfo: Decodable, Identifiable, Hashable {
     var optimizable: Bool?
     var optimized: [String: Bool]?
     var own_bytes: Int?
+    var cloud_provider: String?  // runs on this provider's servers; status.downloaded then means "has an API key"
+    var supports_seed: Bool?
+    var cloud_formats: [String]?
+    var cloud_qualities: [String]?
+    var cloud_complexity: Bool?
+    var supports_markup: Bool?
 
+    var isCloud: Bool { cloud_provider != nil }
     var isTool: Bool { tool == true }
 
     var downloadBytes: Int? { status.bytes_total }
@@ -243,7 +294,7 @@ final class Backend {
     }
 
     /// Bump together with RUNTIME_VERSION in setup.sh when the Python dependencies change.
-    static let runtimeVersion = "3"
+    static let runtimeVersion = "4"
 
     static var isRuntimeInstalled: Bool {
         let marker = runtimeDir.appendingPathComponent("runtime-version")
@@ -422,6 +473,37 @@ final class Backend {
         return try JSONDecoder().decode(TokenStatus.self, from: data)
     }
 
+    func generateCloudBatch(_ requests: [GenerateRequest]) async throws -> CloudBatchResponse {
+        struct Body: Encodable { var requests: [GenerateRequest] }
+        return try JSONDecoder().decode(CloudBatchResponse.self, from: try await post("/generate/cloud-batch", body: Body(requests: requests)))
+    }
+
+    func comparePlan(models: [String], width: Int, height: Int, quantize: Int, quality: String, complexity: String) async throws -> ComparePlan {
+        struct Body: Encodable { var models: [String]; var width: Int; var height: Int; var quantize: Int; var quality: String; var complexity: String }
+        return try JSONDecoder().decode(ComparePlan.self, from: try await post("/compare/plan", body: Body(
+            models: models, width: width, height: height, quantize: quantize, quality: quality, complexity: complexity)))
+    }
+
+    /// After images leave the library: drops their cost entries and cached copies.
+    func forgetRemovedImages() async throws { _ = try await post("/history/forget", body: [String: String]()) }
+
+    func cloudCosts() async throws -> CostSummary {
+        try JSONDecoder().decode(CostSummary.self, from: try await get("/cloud/costs"))
+    }
+
+    func setCloudKey(provider: String, key: String?) async throws {
+        struct Body: Encodable { var provider: String; var key: String? }
+        _ = try await post("/cloud/keys", body: Body(provider: provider, key: key))
+    }
+
+    func testCloudKey(provider: String) async throws -> CloudTestResult {
+        try JSONDecoder().decode(CloudTestResult.self, from: try await post("/cloud/test", body: ["provider": provider]))
+    }
+
+    func testCloudImage(provider: String) async throws -> CloudTestResult {
+        try JSONDecoder().decode(CloudTestResult.self, from: try await post("/cloud/test-image", body: ["provider": provider]))
+    }
+
     func models() async throws -> [ModelInfo] {
         try JSONDecoder().decode([ModelInfo].self, from: try await get("/models"))
     }
@@ -435,7 +517,9 @@ final class Backend {
     }
 
     func downloadModel(_ id: String) async throws { _ = try await post("/models/\(id)/download") }
+    func downloadModels(_ ids: [String]) async throws { _ = try await post("/models/download", body: ["ids": ids]) }
     func cancelDownload(_ id: String) async throws { _ = try await post("/models/\(id)/cancel") }
+    func fetchModelSizes() async throws { _ = try await post("/models/sizes") }
     func deleteModel(_ id: String, scope: String = "all") async throws { _ = try await post("/models/\(id)/delete", body: ["scope": scope]) }
     func unloadModel() async throws { _ = try await post("/unload") }
 

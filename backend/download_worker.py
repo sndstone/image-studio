@@ -11,7 +11,8 @@ from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 def download(source):
     for attempt in range(4):
         try:
-            snapshot_download(repo_id=source["repo"], allow_patterns=source["patterns"])
+            snapshot_download(repo_id=source["repo"], allow_patterns=source["patterns"],
+                              revision=source.get("revision"))
             return
         except (httpx.TransportError, HfHubHTTPError, ConnectionError, TimeoutError) as error:
             status = getattr(getattr(error, "response", None), "status_code", None)

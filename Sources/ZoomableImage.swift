@@ -99,6 +99,7 @@ struct ZoomableImage: NSViewRepresentable {
         scrollView.beforeLoadTask?.cancel()
         scrollView.imageLoadTask?.cancel()
         scrollView.cancelResolutionLoad()
+        scrollView.stopAnimation()
         (scrollView.documentView as? PanningImageView)?.image = nil
         (scrollView.documentView as? PanningImageView)?.beforeImage = nil
         if scrollView.zoom?.scrollView === scrollView { scrollView.zoom?.scrollView = nil }
@@ -125,6 +126,7 @@ final class ZoomScrollView: NSScrollView {
         loadedRevision = revision
         imageLoadTask?.cancel()
         resolutionTask?.cancel()
+        stopAnimation()
         pendingZoom = nil
         sourceSize = .zero
         decodedPixels = 0
@@ -137,8 +139,33 @@ final class ZoomScrollView: NSScrollView {
             sourceSize = size
             imageView.frame = NSRect(origin: .zero, size: size)
             zoom?.fit()
-            ensureResolution(for: magnification)
+            guard url.isGIF else { ensureResolution(for: magnification); return }
+            let frames = await Task.detached(priority: .userInitiated) { GIFFrames.decode(url) }.value
+            guard !Task.isCancelled, loadedURL == url, !frames.isEmpty else { return }
+            decodedPixels = Int(ceil(max(size.width, size.height)))  // already at full size: no sharper decode to load
+            play(frames, in: imageView)
         }
+    }
+
+    private var animationTimer: Timer?
+
+    /// By hand rather than NSImageView.animates, which doesn't play in this custom-drawn view.
+    private func play(_ frames: [GIFFrames.Frame], in imageView: PanningImageView, from index: Int = 0) {
+        imageView.image = frames[index].image
+        guard frames.count > 1 else { return }
+        let timer = Timer(timeInterval: frames[index].delay, repeats: false) { [weak self, weak imageView] _ in
+            MainActor.assumeIsolated {
+                guard let self, let imageView else { return }
+                self.play(frames, in: imageView, from: (index + 1) % frames.count)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)  // keeps playing during a live zoom or scroll
+        animationTimer = timer
+    }
+
+    func stopAnimation() {
+        animationTimer?.invalidate()
+        animationTimer = nil
     }
 
     var requestedMagnification: CGFloat { pendingZoom?.scale ?? magnification }
@@ -181,6 +208,7 @@ final class ZoomScrollView: NSScrollView {
     }
 
     nonisolated private static func decodeImage(_ url: URL, maxPixels: Int) -> NSImage? {
+        if url.isSVG { return SVGImages.render(url, maxPixels: maxPixels).map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) } }
         guard !Task.isCancelled,
               let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
         let options: [CFString: Any] = [

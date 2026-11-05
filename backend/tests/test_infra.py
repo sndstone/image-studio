@@ -113,7 +113,9 @@ class InfraTests(unittest.TestCase):
             component = folder/part; component.mkdir(parents=True)
             (component/'0.safetensors').write_bytes(b'weight')
             (component/'model.safetensors.index.json').write_text(json.dumps({'weight_map': {'w':'0.safetensors'}}))
-        base = d._repo_dir(self.spec.sources[0].repo)/'snapshots'/'rev'; base.mkdir(parents=True)
+        # mflux 0.23 pins Z-Image's repo; only that commit's snapshot is the downloaded model.
+        base_repo = self.spec.sources[0].repo
+        base = d._repo_dir(base_repo)/'snapshots'/(d._revision(base_repo) or 'rev'); base.mkdir(parents=True)
         gguf = d._repo_dir(self.spec.gguf[0])/'snapshots'/'rev'/self.spec.gguf[1]
         gguf.parent.mkdir(parents=True); gguf.write_bytes(b'gguf')
         self.assertIn('|', optimized.base_snapshot(self.spec))

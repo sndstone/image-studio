@@ -188,8 +188,9 @@ def disk_bytes(root):
     total = 0
     for path in root.rglob("*"):
         try:
-            if path.is_file() and not path.is_symlink():
-                total += path.stat().st_size
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
         except FileNotFoundError:
             pass  # A download or cleanup may have replaced it while polling.
     return total

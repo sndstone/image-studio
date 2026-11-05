@@ -23,34 +23,10 @@ struct StatusBarView: View {
     }
 
     private var activity: some View {
-        let s = model.status
-        let busy = s.map { $0.phase != "idle" } ?? false
-        let text: String = {
-            guard let s else { return model.engineUnreachable ? "Engine unreachable" : "Starting…" }
-            let name = model.models.first { $0.id == (s.loaded_model ?? "") }?.name
-            switch s.phase {
-            case "upscaling": return "Upscaling image…"
-            case "optimizing": return "Optimizing model…"
-            case "loading": return "Loading model into memory…"
-            case "converting": return "Converting model for first use · \(s.step)/\(s.total_steps) tensors"
-            case "encoding": return "Reading prompt and input images"
-            case "denoising":
-                return "Generating · step \(s.step)/\(s.total_steps)" + ((s.passes ?? 1) > 1 ? " (2 passes each: guidance)" : "")
-            case "decoding": return "Decoding image"
-            case "saving": return "Saving"
-            default:
-                if let downloading = model.models.first(where: { $0.status.downloading }) {
-                    return "Downloading \(downloading.name)"
-                }
-                if s.auto_unloaded == true {
-                    return "Idle · model unloaded after \(s.idle_unload_minutes ?? 0) idle min to free memory"
-                }
-                return name.map { "Idle · \($0) loaded" } ?? "Idle · no model loaded"
-            }
-        }()
+        let busy = model.status.map { $0.phase != "idle" } ?? false
         return HStack(spacing: 6) {
             Circle().fill(busy ? Color.green : Color.secondary.opacity(0.5)).frame(width: 7, height: 7)
-            Text(text).foregroundStyle(busy ? .primary : .secondary).lineLimit(1)
+            Text(model.activityText).foregroundStyle(busy ? .primary : .secondary).lineLimit(1)
         }
     }
 
@@ -140,5 +116,42 @@ struct Sparkline: View {
             context.stroke(line, with: .color(.accentColor), lineWidth: 1.2)
         }
         .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.1)))
+    }
+}
+
+extension AppModel {
+    /// What the engine is doing right now, for the status bar and the window subtitle.
+    var activityText: String {
+        guard let s = status else { return engineUnreachable ? "Engine unreachable" : "Starting…" }
+        let name = models.first { $0.id == (s.loaded_model ?? "") }?.name
+        switch s.phase {
+        case "cloud": return s.message
+        case "upscaling": return "Upscaling image…"
+        case "optimizing": return "Optimizing model…"
+        case "loading": return "Loading model into memory…"
+        case "converting": return "Converting model for first use · \(s.step)/\(s.total_steps) tensors"
+        case "encoding": return "Reading prompt and input images"
+        case "denoising":
+            return "Generating · step \(s.step)/\(s.total_steps)" + ((s.passes ?? 1) > 1 ? " (2 passes each: guidance)" : "")
+        case "decoding": return "Decoding image"
+        case "saving": return "Saving"
+        default:
+            if let downloading = models.first(where: { $0.status.downloading }) {
+                return "Downloading \(downloading.name)"
+            }
+            if s.auto_unloaded == true {
+                return "Idle · model unloaded after \(s.idle_unload_minutes ?? 0) idle min to free memory"
+            }
+            return name.map { "Idle · \($0) loaded" } ?? "Idle · no model loaded"
+        }
+    }
+
+    /// Short form for the window subtitle: progress while busy, otherwise the chosen model.
+    var windowSubtitle: String {
+        if let s = status, s.phase != "idle" {
+            let queued = queue.isEmpty ? "" : " · \(queue.count) queued"
+            return activityText + queued
+        }
+        return currentModel?.name ?? ""
     }
 }

@@ -79,8 +79,9 @@ class MemoryPerformanceTests(unittest.TestCase):
                 rows = server.list_models()
                 custom_read.assert_called_once_with()
                 timing_read.assert_called_once_with()
-                self.assertEqual([call.args[0].id for call in converted.call_args_list], [r["id"] for r in rows])
-                self.assertTrue(all(r["own_bytes"] == r["disk_bytes"] == 17 for r in rows))
+                local = [r for r in rows if not r["cloud_provider"]]  # cloud models have nothing on disk
+                self.assertEqual([call.args[0].id for call in converted.call_args_list], [r["id"] for r in local])
+                self.assertTrue(all(r["own_bytes"] == r["disk_bytes"] == 17 for r in local))
                 return {r["id"]: r for r in rows}
 
             before = poll()

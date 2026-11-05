@@ -5,21 +5,16 @@ import ImageIO
 
 struct GenerateBar: View {
     @EnvironmentObject var model: AppModel
+    @State private var jobEstimate: Estimate?  // estimate for the running job's own request, not the editor's settings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let error = model.errorMessage {
-                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled).lineLimit(4)
-            }
+            if let error = model.errorMessage { StudioNote(.error, error) }
             // The pre-job check and the engine often report the same memory warning; show it once.
             let notes = [model.status?.memory_warning, model.preflightNote].compactMap { $0 }
-            ForEach(Array(Set(notes)).sorted(), id: \.self) { note in
-                Text(note).font(.caption).foregroundStyle(.orange)
-            }
-            if model.models.isEmpty, let error = model.modelError { Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
-            if let error = model.modelErrors[model.modelID] ?? model.currentModel?.status.error {
-                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-            }
+            ForEach(Array(Set(notes)).sorted(), id: \.self) { note in StudioNote(.warning, note) }
+            if model.models.isEmpty, let error = model.modelError { StudioNote(.error, error) }
+            if let error = model.modelErrors[model.modelID] ?? model.currentModel?.status.error { StudioNote(.error, error) }
             if model.isGenerating {
                 ProgressView(value: progress) {
                     Text(progressLabel).font(.caption)
@@ -49,6 +44,12 @@ struct GenerateBar: View {
                     Text("Cancel Download").frame(maxWidth: .infinity)
                 }
                 .controlSize(.large)
+            } else if let info = model.currentModel, info.isCloud, !info.status.downloaded {
+                Button { model.openCloudSettings() } label: {
+                    Label("Add \(cloudProviderName(info)) API Key…", systemImage: "key").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             } else if let info = model.currentModel, !info.status.downloaded {
                 Button { model.download(info) } label: {
                     Label("Download \(info.name)" + (info.status.bytes_total.map { " (\(formatBytes($0)))" } ?? ""),
@@ -66,29 +67,58 @@ struct GenerateBar: View {
                 .disabled(model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .keyboardShortcut(.return, modifiers: .command)
                 HStack {
-                    EstimateLine(estimate: model.estimate, count: model.count)
+                    if let info = model.currentModel, info.isCloud {
+                        Label(cloudCostLine(info), systemImage: "cloud")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .help("An estimate before the run. The actual cost shows with each image and in Costs (⇧⌘K).")
+                    } else {
+                        EstimateLine(estimate: model.estimate, count: model.count)
+                    }
                     Spacer()
-                    Button("Compare Models…") { model.showCompareSheet = true }
-                        .buttonStyle(.link).font(.caption)
-                        .disabled(model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .help("Run this prompt on several models and see the results side by side")
                 }
             }
             QueueList()
             if !model.isGenerating {
                 HStack {
-                    Button("Variations ×4") { model.variations() }
-                    Button("Sweep…") { model.showSweep = true }
-                }.font(.caption).disabled(model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button { model.showCompareSheet = true } label: {
+                        Label("Compare…", systemImage: "square.split.2x1")
+                    }
+                    .help("Run this prompt on several models and see the results side by side (⇧⌘C)")
+                    Button { model.variations() } label: {
+                        Label("Variations ×4", systemImage: "square.grid.2x2")
+                    }
+                    if model.currentModel?.isCloud != true {
+                        Button { model.showSweep = true } label: {
+                            Label("Sweep…", systemImage: "slider.horizontal.3")
+                        }
+                    }
+                }.buttonStyle(StudioButtonStyle()).disabled(model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .sheet(isPresented: $model.showCompareSheet) { CompareSheet() }
         .sheet(isPresented: $model.showSweep) { SweepView() }
+        .task(id: model.currentJob?.id) {
+            // Estimate the running job's own request: queued jobs can differ from what the editor shows now.
+            jobEstimate = nil
+            guard let job = model.currentJob, case .generate(let request) = job.kind else { return }
+            let estimate = try? await model.backend.estimate(request)
+            guard !Task.isCancelled, model.currentJob?.id == job.id else { return }
+            jobEstimate = estimate
+        }
         .task(id: model.estimateKey) {
             try? await Task.sleep(nanoseconds: 250_000_000)  // settle while a slider is dragged
             guard !Task.isCancelled else { return }
             await model.refreshEstimate()
         }
+    }
+
+    /// One image's expected price, or plainly that it isn't known until a run has reported it.
+    private func cloudCostLine(_ info: ModelInfo) -> String {
+        if model.effectiveOutputFormat(for: info) == "svg" { return "Billed by OpenAI · an SVG's cost isn't known here: see your OpenAI usage" }
+        guard let cost = model.estimate?.cost_usd else { return "Billed by \(cloudProviderName(info)) · cost shows after the first run" }
+        let total = cost * Double(max(1, model.count))
+        let basis = model.estimate?.cost_basis == "list" ? "list price" : "your recent runs"
+        return "≈ \(formatUSD(total))" + (model.count > 1 ? " for \(model.count) images" : " per image") + " · \(basis)"
     }
 
     private var progress: Double? {
@@ -101,17 +131,25 @@ struct GenerateBar: View {
         return min(0.95, max(0, (Double(s.image_index - 1) + perImage) / Double(s.image_count)))
     }
 
+    /// Remaining time from the learned estimate and the progress so far; blank until both are known.
+    private var timeLeft: String {
+        guard let seconds = jobEstimate?.seconds, let progress, progress > 0.05 else { return "" }
+        let left = seconds * (1 - progress)  // the estimate already covers the whole batch
+        return left >= 2 ? " · ≈ \(formatDuration(left)) left" : ""
+    }
+
     private var progressLabel: String {
         guard let s = model.status else { return "Starting…" }
         if s.phase == "loading" { return s.message }
         let prefix = s.image_count > 1 ? "Image \(s.image_index)/\(s.image_count) · " : ""
         switch s.phase {
         case "converting": return "Converting model for first use (one time)…"
+        case "cloud": return prefix + s.message
         case "upscaling": return "Upscaling…"
         case "optimizing": return "Optimizing model…"
         case "encoding": return prefix + "Reading prompt and input images…"
         case "denoising":
-            return prefix + "Step \(s.step)/\(s.total_steps)" + ((s.passes ?? 1) > 1 ? " · 2 passes per step" : "")
+            return prefix + "Step \(s.step)/\(s.total_steps)" + ((s.passes ?? 1) > 1 ? " · 2 passes per step" : "") + timeLeft
         case "decoding": return prefix + "Decoding image…"
         case "saving": return prefix + "Saving…"
         default: return s.message

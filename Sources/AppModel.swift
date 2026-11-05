@@ -52,6 +52,7 @@ struct QueuedJob: Identifiable, Hashable, Codable {
     enum Kind: Hashable, Codable {
         case generate(GenerateRequest)
         case upscale(URL, Double, Double)
+        case cloudBatch([GenerateRequest])  // Compare: cloud models running at the same time
     }
 
     var id = UUID()
@@ -118,6 +119,7 @@ struct HistoryMetadata {
     var upscale: Double?
     var seconds: Double
     var comparisonSource: URL?
+    var costUSD: Double? = nil
     var description: HistoryDescription
 }
 
@@ -131,7 +133,7 @@ final class AppModel: ObservableObject {
         didSet {
             defer { editorSettingsChanged() }
             guard !restoringSettings else { return }
-            if references.first != oldValue.first { maskPath = nil }
+            if references.first != oldValue.first { maskPath = nil; markupPath = nil }
             // Composing needs every image rather than anchoring the edit to image 1.
             if references.count >= 2, oldValue.count < 2, imageMode == "init",
                currentModel?.image_modes.contains("reference") == true {
@@ -188,6 +190,8 @@ final class AppModel: ObservableObject {
     @Published var maskPath: URL? { didSet { editorSettingsChanged() } }
     @Published var loras: [LoraSetting] = [] { didSet { editorSettingsChanged() } }
     @Published var showMaskEditor = false
+    @Published var showMarkupEditor = false
+    @Published var markupPath: URL? { didSet { editorSettingsChanged() } }
     @Published var showSweep = false
     @Published var showFullView = false
     @Published var upscaleFileItem: HistoryItem?
@@ -197,6 +201,9 @@ final class AppModel: ObservableObject {
     @Published var engineUnresponsive = false
     @Published var previewNote: String?
     @Published var preflightNote: String?
+    @Published var promptFocusRequest = 0        // bumped by ⌘L; the prompt editor takes focus
+    @Published var historySearchFocusRequest = 0 // bumped by ⌘F; the history search field opens and takes focus
+    @Published var historySearchVisible = false
     @Published var historySearch = "" { didSet { if historySearch != oldValue { updateFilteredHistory() } } }
     @Published var favoritesOnly = false { didSet { if favoritesOnly != oldValue { updateFilteredHistory() } } }
     @Published var favorites: Set<String> = [] { didSet { if favorites != oldValue { updateFilteredHistory() } } }
@@ -222,6 +229,22 @@ final class AppModel: ObservableObject {
     @Published var embedMetadata = UserDefaults.standard.bool(forKey: "embedMetadata") { didSet { updateEngineSettings() } }
     @Published var lowMemory = UserDefaults.standard.string(forKey: "lowMemory") ?? "auto" { didSet { updateEngineSettings() } }
     @Published var offline = UserDefaults.standard.bool(forKey: "offline") { didSet { updateEngineSettings() } }
+    // GPT Image options. The picks stay when another model can't use them, and apply again on switching back.
+    @Published var openaiQuality = UserDefaults.standard.string(forKey: "openaiQuality") ?? "auto" {
+        didSet { UserDefaults.standard.set(openaiQuality, forKey: "openaiQuality"); editorSettingsChanged() }
+    }
+    @Published var openaiComplexity = "high" { didSet { editorSettingsChanged() } }
+    @Published var outputFormat = "png" { didSet { editorSettingsChanged() } }
+    @Published var gifFrameCount = 9 { didSet { editorSettingsChanged() } }
+    @Published var gifFrameDuration = 200 { didSet { editorSettingsChanged() } }  // milliseconds per frame
+    @Published var gifAutoSize = true { didSet { editorSettingsChanged() } }
+    @Published var cloudKeys: [String: String] = [:]  // saved in the Keychain
+    @Published var cloudDrafts: [String: String] = [:]
+    @Published var cloudResults: [String: CloudTestResult] = [:]
+    @Published var cloudBusy: Set<String> = []
+    @Published var settingsTab = "general"
+    @Published var showCosts = false
+    var openSettingsWindow: (() -> Void)?  // SwiftUI's openSettings: only a view can get it, and macOS ignores other ways
     var restoringQueue = false
     var restoringSettings = false
 
@@ -342,6 +365,7 @@ final class AppModel: ObservableObject {
                 ? nil : await Task.detached { Keychain.read() }.value
             hasSavedToken = saved != nil
             tokenDraft = saved ?? ""
+            await loadCloudKeys()
             try await startBackend(token: saved)
             await refreshModels()
             if currentModel?.status.downloaded != true,
@@ -377,6 +401,26 @@ final class AppModel: ObservableObject {
             references = paths.split(separator: ":").map { URL(fileURLWithPath: String($0)) }
         }
         if let mode = env["IMAGE_STUDIO_TEST_MODE"] { imageMode = mode }
+        if let format = env["IMAGE_STUDIO_TEST_OUTPUT_FORMAT"] { outputFormat = format }
+        if env["IMAGE_STUDIO_TEST_MARKUP"] != nil { showMarkupEditor = true }
+        if let path = env["IMAGE_STUDIO_TEST_TRASH_PATH"] {  // the file named, never whatever happens to be selected
+            Task {
+                try? await Task.sleep(for: .seconds(8))
+                delete(HistoryItem(url: URL(fileURLWithPath: path), seed: 0, seconds: 0))
+            }
+        }
+        if env["IMAGE_STUDIO_TEST_MANAGER"] == "1" { showModelManager = true }
+        if let tab = env["IMAGE_STUDIO_TEST_SETTINGS"] {
+            openSettingsWindow?()
+            Task { try? await Task.sleep(for: .milliseconds(150)); settingsTab = tab }
+        }
+        if let size = env["IMAGE_STUDIO_TEST_SIZE"].flatMap(Int.init) { width = size; height = size; autoSize = false }
+        if let ids = env["IMAGE_STUDIO_TEST_COMPARE_MODELS"] {  // types the prompt and runs a comparison
+            prompt = env["IMAGE_STUDIO_TEST_PROMPT"] ?? "A red fox in fresh snow"
+            compare(modelIDs: ids.components(separatedBy: ","))
+        }
+        if env["IMAGE_STUDIO_TEST_COSTS"] == "1" { showCosts = true }
+        if env["IMAGE_STUDIO_TEST_COMPARE_SHEET"] == "1" { showCompareSheet = true }
         if let g = env["IMAGE_STUDIO_TEST_GUIDANCE"].flatMap(Double.init) { guidance = g }
         if let path = env["IMAGE_STUDIO_TEST_SELECT"] {
             let item = HistoryItem(url: URL(fileURLWithPath: path), seed: 0, seconds: 0)
@@ -442,6 +486,7 @@ final class AppModel: ObservableObject {
             try? await backend.setIdleUnload(minutes: idleUnloadMinutes)
             try? await backend.setLivePreview(livePreview)
             try? await backend.setSettings(engineSettings)
+            await pushCloudKeys()
             if backend.isAlive, deferredBackendExit == nil { break }
             // A successful /health response is not enough: the process can exit during settings.
             try recordBackendExit(deferredBackendExit ?? backend.exitCode ?? -1)
@@ -497,7 +542,7 @@ final class AppModel: ObservableObject {
     func generate() {
         guard phase == .ready, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard let model = currentModel, model.status.downloaded, !model.isTool else {
-            showModelManager = true
+            if currentModel?.isCloud == true { openCloudSettings() } else { showModelManager = true }
             return
         }
         let missing = references.filter { !FileManager.default.fileExists(atPath: $0.path) }
@@ -519,7 +564,8 @@ final class AppModel: ObservableObject {
         let sharedSeed = randomSeed ? Int.random(in: 0..<Int(Int32.max)) : seed
         activeCompareGroup = group
         compareItems = []
-        for info in chosen {
+        // Each model on its own recommended settings, and without LoRAs or masks made for another one.
+        func request(for info: ModelInfo) -> GenerateRequest {
             var request = makeRequest(for: info)
             request.steps = info.default_steps
             request.guidance = max(info.min_guidance, info.default_guidance)
@@ -531,12 +577,32 @@ final class AppModel: ObservableObject {
             request.loras = []
             request.mask_path = nil
             request.auto_mask = nil
-            request.lora_path = nil  // a LoRA only fits the model it was trained for
-            enqueue(QueuedJob(kind: .generate(request), title: "Compare · \(info.name)", compareGroup: group))
+            request.lora_path = nil
+            request.markup_path = nil  // drawn for one model's edit, like a mask
+            if info.cloud_provider == "openai" {  // side by side means stills: most models can't make anything else
+                request.output_format = "png"
+                request.frame_count = nil
+                request.frame_duration_ms = nil
+            }
+            return request
+        }
+        let cloudRequests = chosen.filter(\.isCloud).map(request)
+        // The cloud models first, all at once: they're quick and don't compete for this Mac's memory.
+        if cloudRequests.count > 1 {
+            enqueue(QueuedJob(kind: .cloudBatch(cloudRequests), title: "Compare · \(cloudRequests.count) cloud models", compareGroup: group))
+        } else if let only = cloudRequests.first, let info = chosen.first(where: { $0.id == only.model }) {
+            enqueue(QueuedJob(kind: .generate(only), title: "Compare · \(info.name)", compareGroup: group))
+        }
+        // Local models take turns; the engine keeps the previous one loaded if the next one also fits.
+        for info in chosen where !info.isCloud {
+            var local = request(for: info)
+            local.keep_loaded = true
+            enqueue(QueuedJob(kind: .generate(local), title: "Compare · \(info.name)", compareGroup: group))
         }
     }
 
     func upscale(_ item: HistoryItem) {
+        guard item.url.canUpscale else { errorMessage = "Only still pixel images can be upscaled."; return }
         guard let upscaler = models.first(where: { $0.family == "seedvr2" }) else { return }
         guard upscaler.status.downloaded else {
             errorMessage = "Upscaling needs \(upscaler.name) (\(upscaler.status.bytes_total.map(formatBytes) ?? "a one-time download")). Download it in the Model Manager."
@@ -596,12 +662,25 @@ final class AppModel: ObservableObject {
                     let response = try await retryBusy { try await self.backend.generate(checked) }
                     if let error = response.error {
                         errorMessage = error
-                        failedJobs.append(FailedJob(job: job, error: error))
+                        failedJobs.append(FailedJob(job: retryJob(job, request: checked, done: response.images), error: error))
                     }
                     items = response.images.map {
                         HistoryItem(url: URL(fileURLWithPath: $0.path), seed: $0.seed, seconds: $0.seconds)
                     }
                     if !randomSeed, job.compareGroup == nil, let last = items.last { seed = last.seed }
+                case .cloudBatch(let requests):
+                    let response = try await retryBusy { try await self.backend.generateCloudBatch(requests) }
+                    // Each model fails on its own, so Retry only runs (and bills) the ones that did.
+                    for result in response.results {
+                        guard let error = result.error, let request = requests.first(where: { $0.model == result.model }) else { continue }
+                        let name = models.first { $0.id == result.model }?.name ?? result.model
+                        let message = "\(name): \(error)"
+                        errorMessage = errorMessage.map { $0 + "\n" + message } ?? message
+                        failedJobs.append(FailedJob(job: QueuedJob(kind: .generate(request), title: "Compare · \(name)", compareGroup: job.compareGroup), error: error))
+                    }
+                    items = response.images.map {
+                        HistoryItem(url: URL(fileURLWithPath: $0.path), seed: $0.seed, seconds: $0.seconds)
+                    }
                 case .upscale(let url, let scale, let softness):
                     let result = try await retryBusy { try await self.backend.upscale(path: url.path, scale: scale, softness: softness) }
                     if result.cancelled == true { throw CancellationError() }
@@ -634,8 +713,15 @@ final class AppModel: ObservableObject {
         Task { await backend.cancel() }
     }
 
+    /// What this model will really output: GIF and SVG need a model that makes them, and no reference images.
+    func effectiveOutputFormat(for model: ModelInfo) -> String {
+        (model.cloud_formats ?? []).contains(outputFormat) && references.isEmpty ? outputFormat : "png"
+    }
+
     func makeRequest(for model: ModelInfo) -> GenerateRequest {
-        GenerateRequest(
+        let openai = model.cloud_provider == "openai"
+        let format = effectiveOutputFormat(for: model)
+        return GenerateRequest(
             prompt: prompt,
             negative_prompt: model.supports_negative && !negativePrompt.isEmpty ? negativePrompt : nil,
             image_paths: model.edit == "none" ? [] : Array(references.prefix(model.max_refs)).map(\.path),
@@ -655,7 +741,14 @@ final class AppModel: ObservableObject {
             mask_path: model.supports_mask == true && !references.isEmpty ? maskPath?.path : nil,
             auto_mask: model.supports_mask == true && !references.isEmpty && !autoMask.isEmpty ? autoMask : nil,
             enhance_prompt: model.supports_enhance == true && model.edit != "none" && model.max_refs > 0 && !references.isEmpty && enhancePrompt,
-            loras: loras
+            loras: loras,
+            quality: !openai ? nil : (model.cloud_qualities ?? []).contains(openaiQuality) ? openaiQuality : "auto",
+            complexity: model.cloud_complexity == true ? openaiComplexity : nil,
+            output_format: openai ? format : nil,
+            frame_count: format == "gif" ? gifFrameCount : nil,
+            frame_duration_ms: format == "gif" ? gifFrameDuration : nil,
+            gif_auto_size: format == "gif" ? gifAutoSize : nil,
+            markup_path: model.supports_markup == true && !references.isEmpty ? markupPath?.path : nil
         )
     }
 
@@ -674,6 +767,7 @@ final class AppModel: ObservableObject {
 
     /// Puts a result in as the image to edit, ready for the next instruction.
     func editImage(_ item: HistoryItem) {
+        guard item.url.canBeReference else { errorMessage = "OpenAI's and the local models' edits need a pixel image, not an SVG."; return }
         invalidateReferenceImports()
         autoSize = true  // keep the edited image's size and shape
         references = [item.url]
@@ -748,6 +842,10 @@ final class AppModel: ObservableObject {
             autoMask = ""
             notes.append("The mask was cleared because this model does not support masks.")
         }
+        if model.supports_markup != true, markupPath != nil {
+            markupPath = nil
+            notes.append("The markup was cleared because this model does not support it.")
+        }
         if !notes.isEmpty { errorMessage = notes.joined(separator: " ") }
         steps = model.default_steps
         guidance = max(model.min_guidance, model.default_guidance)
@@ -793,11 +891,15 @@ final class AppModel: ObservableObject {
     var pathsInUse: [String] {
         var paths = references.map(\.path)
         if let maskPath { paths.append(maskPath.path) }
+        if let markupPath { paths.append(markupPath.path) }
         if let upscaleFileItem { paths.append(upscaleFileItem.url.path) }
         for job in queue + (currentJob.map { [$0] } ?? []) + failedJobs.map(\.job) {
             switch job.kind {
-            case .generate(let request): paths += request.image_paths; if let mask = request.mask_path { paths.append(mask) }
+            case .generate(let request):
+                paths += request.image_paths
+                paths += [request.mask_path, request.markup_path].compactMap { $0 }
             case .upscale(let url, _, _): paths.append(url.path)
+            case .cloudBatch(let requests): paths += requests.flatMap(\.image_paths)
             }
         }
         return paths
@@ -820,6 +922,18 @@ final class AppModel: ObservableObject {
         modelAction(model.id) {
             defer { self.downloadRequests.remove(model.id); self.updateActivity() }
             try await self.backend.downloadModel(model.id)
+            await self.refreshModels()
+        }
+    }
+    /// Every version of a grouped model that isn't downloaded yet, in one request so shared files download once.
+    func downloadGroup(_ name: String, _ versions: [ModelInfo]) {
+        let key = "group:" + name
+        guard !modelBusy.contains(key), !versions.isEmpty else { return }
+        downloadRequests.insert(key)
+        updateActivity()
+        modelAction(key) {
+            defer { self.downloadRequests.remove(key); self.updateActivity() }
+            try await self.backend.downloadModels(versions.map(\.id))
             await self.refreshModels()
         }
     }
@@ -983,6 +1097,7 @@ final class AppModel: ObservableObject {
 
     /// Pixel size as displayed, i.e. with EXIF rotation applied (phone photos are often stored sideways).
     nonisolated static func displaySize(of url: URL) -> CGSize? {
+        if url.isSVG { return SVGImages.displaySize(of: url) }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? Double, let h = props[kCGImagePropertyPixelHeight] as? Double,
@@ -997,7 +1112,10 @@ final class AppModel: ObservableObject {
         let directory = outputDir
         let revision = historyRevision
         Task {
-            let found = await Task.detached(priority: .utility) { Self.scanHistory(directory) }.value
+            let found = await Task.detached(priority: .utility) { () -> HistoryScan in
+                Self.trashOrphanedSettings(directory)
+                return Self.scanHistory(directory)
+            }.value
             guard revision == historyRevision else {
                 if !isClearingHistory { loadHistory() }
                 return
@@ -1067,7 +1185,17 @@ final class AppModel: ObservableObject {
         if let paths = json["image_paths"] as? [String] {
             references = paths.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
         }
-        maskPath = (json["mask_path"] as? String).map { URL(fileURLWithPath: $0) }
+        // Drawn on the saved image 1: if that's gone, another image has moved up and they'd land on the wrong one.
+        let sameFirstImage = (json["image_paths"] as? [String])?.first == references.first?.path
+        maskPath = sameFirstImage ? (json["mask_path"] as? String).map { URL(fileURLWithPath: $0) } : nil
+        markupPath = sameFirstImage ? (json["markup_path"] as? String).flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil } : nil
+        // A sidecar without these (another provider, or from before they existed) leaves the current picks.
+        if let v = json["quality"] as? String { openaiQuality = v }
+        if let v = json["complexity"] as? String { openaiComplexity = v }
+        if let v = json["output_format"] as? String { outputFormat = v }
+        if let v = json["frame_count"] as? Int { gifFrameCount = v }
+        if let v = json["frame_duration_ms"] as? Int { gifFrameDuration = v }
+        if let v = json["gif_auto_size"] as? Bool { gifAutoSize = v }
         sizeReferenceIsAuto = json["ui_size_reference_auto"] as? Bool ?? true
         let savedIndex = json["ui_size_reference"] as? Int ?? max(0, references.count - 1)
         if !sizeReferenceIsAuto, let path = json["ui_size_reference_path"] as? String,
@@ -1101,11 +1229,13 @@ final class AppModel: ObservableObject {
     func caption(for item: HistoryItem) -> String {
         guard let metadata = historyMetadata[item.url], metadata.hasSettings else { return item.url.lastPathComponent }
         var parts: [String] = []
-        if let id = metadata.model { parts.append(models.first { $0.id == id }?.name ?? id) }
+        let info = metadata.model.flatMap { id in models.first { $0.id == id } }
+        if let id = metadata.model { parts.append(info?.name ?? id) }
         if let scale = metadata.upscale { parts.append("upscaled \(scale.formatted())×") }
-        else if let steps = metadata.steps { parts.append("\(steps) steps") }
+        else if let steps = metadata.steps, !(info?.isCloud == true && info?.fixed_steps == true) { parts.append("\(steps) steps") }
         let seconds = item.seconds > 0 ? item.seconds : metadata.seconds
         if seconds > 0 { parts.append(formatDuration(seconds)) }
+        if let cost = metadata.costUSD { parts.append(formatUSD(cost)) }
         return parts.joined(separator: " · ")
     }
 
@@ -1150,6 +1280,7 @@ final class AppModel: ObservableObject {
             compareItems.removeAll { removed($0.url) }
             compareSelection = compareSelection.filter { !removed($0) }
             if let selected, removed(selected.url) { self.selected = history.first }
+            forgetRemovedImages()
             if !result.1.isEmpty { errorMessage = "Could not clear some history folders: " + result.1.joined(separator: "\n") }
         }
     }
@@ -1172,5 +1303,6 @@ final class AppModel: ObservableObject {
         compareItems.removeAll { $0.url == item.url }
         compareSelection.remove(item.url)
         if selected == item { selected = history.first }
+        forgetRemovedImages()
     }
 }

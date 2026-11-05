@@ -10,6 +10,7 @@ struct ImageStudioApp: App {
     var body: some Scene {
         Window("Image Studio", id: "main") {
             ContentView()
+                .background(SettingsOpener())
                 .environmentObject(model)
                 .frame(minWidth: 1000, minHeight: 680)
                 .task {
@@ -27,11 +28,25 @@ struct ImageStudioApp: App {
                     .keyboardShortcut("o", modifiers: .command)
                 Button("Model Manager…") { model.showModelManager = true }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
+                Button("Compare Models…") { model.showCompareSheet = true }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.phase != .ready)
+                Button("Costs…") { model.showCosts = true }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
                 Divider()
                 Button("Clear History…") { model.requestClearHistory() }
                     .disabled(model.history.isEmpty || model.isGenerating)
             }
+            CommandGroup(after: .textEditing) {
+                Button("Focus Prompt") { model.promptFocusRequest += 1 }
+                    .keyboardShortcut("l", modifiers: .command)
+                Button("Search History") { model.historySearchFocusRequest += 1 }
+                    .keyboardShortcut("f", modifiers: .command)
+            }
             CommandGroup(after: .toolbar) {
+                Button("Previous Image") { model.selectHistory(offset: -1) }.keyboardShortcut("[", modifiers: .command)
+                Button("Next Image") { model.selectHistory(offset: 1) }.keyboardShortcut("]", modifiers: .command)
+                Divider()
                 Button("Zoom In") { model.zoom.zoomIn() }.keyboardShortcut("=", modifiers: .command)
                 Button("Zoom Out") { model.zoom.zoomOut() }.keyboardShortcut("-", modifiers: .command)
                 Button("Actual Size") { model.zoom.actualSize() }.keyboardShortcut("0", modifiers: .command)
@@ -88,15 +103,31 @@ struct ContentView: View {
                         Button("Restart") { model.restartEngine() }
                     }.padding(10).background(Color.orange.opacity(0.15))
                 }
-                HSplitView {
-                    ControlsView().frame(minWidth: 320, idealWidth: 360, maxWidth: 460)
+                NavigationSplitView {
+                    ControlsView()
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 380, max: 480)
+                        .toolbar {
+                            ToolbarItem(placement: .automatic) { ModelToolbarPicker() }
+                            ToolbarItem(placement: .automatic) {
+                                Button("Manage…") { model.showModelManager = true }
+                                    .help("Download, load, delete or add models (⇧⌘M)")
+                            }
+                            ToolbarItem(placement: .automatic) {
+                                Button { model.showCosts = true } label: { Label("Costs", systemImage: "dollarsign.circle") }
+                                    .help("What cloud images have cost (⇧⌘K)")
+                            }
+                        }
+                } detail: {
                     ResultView().frame(minWidth: 500)
                 }
+                .navigationSplitViewStyle(.balanced)
                 Divider()
                 StatusBarView(monitor: model.monitor)
             }
+            .navigationSubtitle(model.windowSubtitle)
             .background(HistoryKeyboard(model: model).frame(width: 0, height: 0))
             .sheet(isPresented: $model.showModelManager) { ModelManagerView().environmentObject(model) }
+            .sheet(isPresented: $model.showCosts) { CostsView().environmentObject(model) }
             .sheet(item: $model.upscaleFileItem) { item in UpscaleOptionsView(item: item).environmentObject(model) }
             .sheet(isPresented: $model.showFullView) { FullResultView().environmentObject(model) }
         }
@@ -135,3 +166,13 @@ struct LogView: View {
     }
 }
 
+
+/// Gives the model SwiftUI's settings action, so non-view code can open a Settings tab.
+private struct SettingsOpener: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Color.clear.task { model.openSettingsWindow = { openSettings() } }
+    }
+}

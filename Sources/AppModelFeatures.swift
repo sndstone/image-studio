@@ -83,6 +83,13 @@ extension AppModel {
             json["enhance_prompt"] = enhancePrompt
             json["mask_path"] = maskPath?.path
             json["auto_mask"] = autoMask
+            json["markup_path"] = markupPath?.path
+            json["quality"] = openaiQuality
+            json["complexity"] = openaiComplexity
+            json["output_format"] = outputFormat
+            json["frame_count"] = gifFrameCount
+            json["frame_duration_ms"] = gifFrameDuration
+            json["gif_auto_size"] = gifAutoSize
             json["ui_seed"] = seed
             json["ui_random_seed"] = randomSeed
             json["ui_auto_size"] = autoSize
@@ -137,6 +144,12 @@ extension AppModel {
 
     func resetModelDefaults() {
         applyModelDefaults()
+        openaiQuality = "auto"
+        openaiComplexity = "high"
+        outputFormat = "png"
+        gifFrameCount = 9
+        gifFrameDuration = 200
+        gifAutoSize = true
         saveGenerationSettings(model: modelID)
     }
 
@@ -164,6 +177,7 @@ extension AppModel {
         switch job.kind {
         case .generate(let request): count = request.count; upscale = false
         case .upscale: count = 1; upscale = true
+        case .cloudBatch(let requests): count = requests.reduce(0) { $0 + $1.count }; upscale = false
         }
         pendingItems = (0..<max(1, count)).map { PendingItem(index: $0, isUpscale: upscale) }
         selected = nil
@@ -360,6 +374,18 @@ extension AppModel {
         } catch { errorMessage = "Could not restore the queue: " + error.localizedDescription }
     }
 
+    /// Retrying a cloud batch only asks for the images it didn't get: the finished ones were already paid for.
+    func retryJob(_ job: QueuedJob, request: GenerateRequest, done: [GeneratedImageInfo]) -> QueuedJob {
+        guard !done.isEmpty, done.count < request.count, models.first(where: { $0.id == request.model })?.isCloud == true,
+              case .generate = job.kind else { return job }
+        var remaining = request
+        remaining.count = request.count - done.count
+        if remaining.seed != nil, let last = done.last { remaining.seed = last.seed + 1 }
+        var retry = job
+        retry.kind = .generate(remaining)
+        return retry
+    }
+
     func retryFailed(_ failed: FailedJob) {
         failedJobs.removeAll { $0.id == failed.id }
         enqueue(failed.job)
@@ -389,6 +415,7 @@ extension AppModel {
 
     func sweep(parameter: String, values: String) -> String? {
         guard let info = currentModel, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "Enter a prompt first." }
+        guard !info.isCloud else { return "Sweeps aren't available for cloud models." }
         let tokens = values.split(separator: ",", omittingEmptySubsequences: false)
         let numbers = tokens.compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
         guard !numbers.isEmpty, numbers.count == tokens.count, numbers.count <= 64, numbers.allSatisfy({ $0.isFinite }) else { return "Enter up to 64 comma-separated numbers." }
@@ -421,7 +448,11 @@ extension AppModel {
         var result: [(Date, HistoryItem)] = []
         var descriptions: [String: HistoryDescription] = [:]
         var metadata: [URL: HistoryMetadata] = [:]
-        for case let url as URL in enumerator where url.pathExtension.lowercased() == "png" {
+        for case let url as URL in enumerator where url.isGeneratedMedia {
+            // A PNG may be anything saved here; a GIF or SVG counts when it's one of ours: it has a settings
+            // file, or the model in its name in case that file couldn't be written.
+            if url.pathExtension.lowercased() != "png", !url.lastPathComponent.contains("_gpt-image-"),
+               !fm.fileExists(atPath: url.deletingPathExtension().appendingPathExtension("json").path) { continue }
             let version = HistoryMetadataVersion(at: url)
             let json = settingsJSON(at: url)
             var record = readMetadata(at: url, json: json)
@@ -449,7 +480,7 @@ extension AppModel {
     }
 
     func importSettings(from url: URL) -> Bool {
-        guard url.pathExtension.lowercased() == "png", let json = Self.settingsJSON(at: url), json["prompt"] != nil, json["model"] != nil else { return false }
+        guard url.isGeneratedMedia, let json = Self.settingsJSON(at: url), json["prompt"] != nil, json["model"] != nil else { return false }
         restoreSettings(json)
         return true
     }
@@ -479,7 +510,7 @@ extension AppModel {
     /// One queued operation, so a later paste or drop can't overtake it.
     func importDroppedFile(_ url: URL) {
         enqueueReferenceWork({ () -> ([String: Any]?, [URL]) in
-            if url.pathExtension.lowercased() == "png", let json = Self.settingsJSON(at: url),
+            if url.isGeneratedMedia, let json = Self.settingsJSON(at: url),
                json["prompt"] != nil, json["model"] != nil {
                 return (json, [])
             }
@@ -541,6 +572,20 @@ extension AppModel {
 
     func toggleFavorite(_ item: HistoryItem) {
         if favorites.contains(item.url.path) { favorites.remove(item.url.path) } else { favorites.insert(item.url.path) }
+        saveFavorites()
+    }
+
+    /// The trashed images' traces outside the history lists: favorites, cost entries, cached reference copies.
+    func forgetRemovedImages() {
+        let present = favorites.filter { FileManager.default.fileExists(atPath: $0) }
+        if present != favorites {
+            favorites = present
+            saveFavorites()
+        }
+        Task { try? await backend.forgetRemovedImages() }
+    }
+
+    func saveFavorites() {
         do {
             try FileManager.default.createDirectory(at: Backend.runtimeDir, withIntermediateDirectories: true)
             try JSONEncoder().encode(favorites).write(to: Backend.runtimeDir.appendingPathComponent("favorites.json"), options: .atomic)
@@ -550,8 +595,29 @@ extension AppModel {
     func restoreLibraryState() {
         let file = Backend.runtimeDir.appendingPathComponent("favorites.json")
         guard FileManager.default.fileExists(atPath: file.path) else { return }
-        do { favorites = try JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: file)) }
+        do {
+            let saved = try JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: file))
+            favorites = saved.filter { FileManager.default.fileExists(atPath: $0) }  // removed in Finder meanwhile
+            if favorites != saved { saveFavorites() }
+        }
         catch { errorMessage = "Could not read favorites: " + error.localizedDescription }
+    }
+
+    /// An image removed in Finder leaves its settings (prompt, cost) behind, which would also stop Clear History
+    /// from recognising the folder. They go to the Trash, as a deleted image's do. Date folders and our files only.
+    nonisolated static func trashOrphanedSettings(_ directory: URL) {
+        let fm = FileManager.default
+        for folder in (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        where folder.lastPathComponent.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+            let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            let images = Set(files.filter(\.isGeneratedMedia).map { $0.deletingPathExtension().lastPathComponent })
+            for file in files where file.pathExtension.lowercased() == "json" && !images.contains(file.deletingPathExtension().lastPathComponent) {
+                guard let data = try? Data(contentsOf: file),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      json["prompt"] != nil, json["model"] != nil, json["seed"] != nil else { continue }
+                try? fm.trashItem(at: file, resultingItemURL: nil)
+            }
+        }
     }
 
     nonisolated static func scanAppDateFolders(_ directory: URL) -> [URL] {
@@ -560,7 +626,7 @@ extension AppModel {
             guard folder.lastPathComponent.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil,
                   (try? folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return false }
             let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-            let images = files.filter { $0.pathExtension.lowercased() == "png" }
+            let images = files.filter(\.isGeneratedMedia)
             guard !images.isEmpty, images.allSatisfy({ image in
                 let json = Self.settingsJSON(at: image)
                 return json?["model"] != nil && json?["prompt"] != nil && json?["seed"] != nil
@@ -575,8 +641,9 @@ extension AppModel {
         let directory = outputDir
         Task {
             let count = await Task.detached(priority: .utility) {
-                Self.scanAppDateFolders(directory).reduce(0) { count, folder in
-                    count + (((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension.lowercased() == "png" }.count)
+                Self.trashOrphanedSettings(directory)
+                return Self.scanAppDateFolders(directory).reduce(0) { count, folder in
+                    count + (((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []).filter(\.isGeneratedMedia).count)
                 }
             }.value
             clearHistoryCount = count

@@ -76,8 +76,7 @@ struct QueueList: View {
                     }
                     Button("Clear") { model.clearQueue() }
                 }.buttonStyle(.link).font(.caption)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 5) {
+                let rows = VStack(alignment: .leading, spacing: 5) {
                         if let job = model.currentJob {
                             // The running job stays at the top, so the list reads in run order.
                             HStack {
@@ -113,11 +112,17 @@ struct QueueList: View {
                                     Button("Retry") { model.retryFailed(failed) }
                                     Button { model.failedJobs.removeAll { $0.id == failed.id } } label: { Image(systemName: "xmark.circle") }
                                 }
+                                // Engine errors can be long; the full text stays selectable in the tooltip and on copy.
                                 Text(failed.error).foregroundStyle(.red).textSelection(.enabled)
+                                    .lineLimit(3)
+                                    .help(failed.error)
                             }
                         }
-                    }.font(.caption)
-                }.frame(maxHeight: 160)
+                }.font(.caption)
+                // Grows with short rows; past about six, or with failed jobs (whose errors take several
+                // lines), it scrolls in a fixed height so it can never push the generate bar off screen.
+                let count = (model.currentJob == nil ? 0 : 1) + model.queue.count
+                if count > 6 || !model.failedJobs.isEmpty { ScrollView { rows }.frame(height: 160) } else { rows }
             }.padding(8).background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
         }
     }
@@ -172,7 +177,12 @@ struct UpscaleOptionsView: View {
                 Text(model.upscaleSoftness.formatted(.number.precision(.fractionLength(2))))
             }
             Text("Output must be at most 4.5 megapixels.").font(.caption).foregroundStyle(.secondary)
-            Button("Upscale") { model.upscale(item); dismiss() }.disabled(!allowed(model.upscaleScale))
+            Button { model.upscale(item); dismiss() } label: {
+                Label("Upscale Image", systemImage: "arrow.up.left.and.arrow.down.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent).controlSize(.large)
+            .disabled(!allowed(model.upscaleScale))
         }.padding(16).frame(width: 300)
     }
 }

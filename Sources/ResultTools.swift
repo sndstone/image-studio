@@ -38,6 +38,7 @@ struct ExportView: View {
     @State private var error: String?
     private var formats: [(String, String)] {
         var values = [("PNG", UTType.png.identifier), ("JPEG", UTType.jpeg.identifier), ("HEIC", UTType.heic.identifier)]
+        if let badge = item.url.formatBadge { values.insert(("\(badge) (original file)", ImageExports.original), at: 0) }
         let supported = CGImageDestinationCopyTypeIdentifiers() as! [String]
         if supported.contains(UTType.webP.identifier) { values.append(("WebP", UTType.webP.identifier)) }
         return values
@@ -46,7 +47,10 @@ struct ExportView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Export Image").font(.headline)
             Picker("Format", selection: $format) { ForEach(formats, id: \.1) { Text($0.0).tag($0.1) } }
-            Toggle("Remove metadata", isOn: $removeMetadata)
+            if format != ImageExports.original { Toggle("Remove metadata", isOn: $removeMetadata) }
+            if item.url.isGIF && format != ImageExports.original {
+                Text("Only the first frame is exported in this format.").font(.caption).foregroundStyle(.secondary)
+            }
             if let error { Text(error).font(.caption).foregroundStyle(.red) }
             HStack {
                 Spacer()
@@ -54,10 +58,11 @@ struct ExportView: View {
                 Button("Export…") { export() }.disabled(isExporting).keyboardShortcut(.defaultAction)
             }
         }.padding(20).frame(width: 350)
+        .onAppear { if item.url.formatBadge != nil { format = ImageExports.original } }
     }
     private func export() {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(format) ?? .png]
+        panel.allowedContentTypes = [format == ImageExports.original ? (UTType(filenameExtension: item.url.pathExtension) ?? .data) : (UTType(format) ?? .png)]
         panel.nameFieldStringValue = item.url.deletingPathExtension().lastPathComponent
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard url.standardizedFileURL != item.url.standardizedFileURL else { error = "Choose a new filename to preserve the original."; return }

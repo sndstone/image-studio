@@ -20,6 +20,11 @@ trap 'rm -rf "$OUT"' EXIT
 swiftc -O -wmo -swift-version 5 -parse-as-library -warnings-as-errors \
   -target arm64-apple-macos14.0 -o "$OUT/ImageStudio" Sources/*.swift
 
+step "Image export regressions"
+swiftc -swift-version 5 -warnings-as-errors \
+  -o "$OUT/ImageExportsTests" Sources/ImageExports.swift Sources/MediaFormats.swift tests/swift/ImageExportsTests.swift
+"$OUT/ImageExportsTests"
+
 step "Privacy scan"
 # Generic patterns: home-folder paths, private IPv4 addresses, mDNS hostnames, tokens and keys.
 # Personal names, hostnames or file names go in .git/info/private-patterns (one extended regex

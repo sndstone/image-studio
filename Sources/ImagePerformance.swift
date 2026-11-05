@@ -44,7 +44,10 @@ extension AppModel {
                                       model: modelID, quantize: quantize, width: width, height: height, steps: steps,
                                       guidance: guidance, strength: strength, image_mode: imageMode, seed: seed, count: count,
                                       lora_path: loraPath?.path, lora_scale: loraScale, fast: fast, mask_path: maskPath?.path,
-                                      auto_mask: autoMask, enhance_prompt: enhancePrompt, loras: loras)
+                                      auto_mask: autoMask, enhance_prompt: enhancePrompt, loras: loras,
+                                      quality: openaiQuality, complexity: openaiComplexity, output_format: outputFormat,
+                                      frame_count: gifFrameCount, frame_duration_ms: gifFrameDuration,
+                                      gif_auto_size: gifAutoSize, markup_path: markupPath?.path)
         return EditorSettingsSnapshot(request: request, randomSeed: randomSeed, autoSize: autoSize,
                                       sizeReference: sizeReference, sizeReferenceIsAuto: sizeReferenceIsAuto, selectedURL: selected?.url)
     }
@@ -70,7 +73,7 @@ extension AppModel {
         let source = path.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
         return HistoryMetadata(version: HistoryMetadataVersion(at: url), hasSettings: hasSettings, model: json["model"] as? String, steps: json["steps"] as? Int,
                                upscale: json["upscale"] as? Double, seconds: json["seconds"] as? Double ?? 0,
-                               comparisonSource: source,
+                               comparisonSource: source, costUSD: json["cost_usd"] as? Double,
                                description: HistoryDescription(prompt: json["prompt"] as? String ?? "", model: json["model"] as? String ?? ""))
     }
 
@@ -160,27 +163,5 @@ enum ImageImports {
               let output = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(output, cg, nil)
         return CGImageDestinationFinalize(output) ? url : nil
-    }
-}
-
-enum ImageExports {
-    static func write(input: URL, output: URL, format: String, removeMetadata: Bool) -> String? {
-        guard let source = CGImageSourceCreateWithURL(input as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
-              let destination = CGImageDestinationCreateWithURL(output as CFURL, format as CFString, 1, nil) else {
-            return "This image format could not be exported."
-        }
-        var properties: [CFString: Any] = [:]
-        if !removeMetadata {
-            properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
-            if let json = AppModel.settingsJSON(at: input), let data = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) {
-                var exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
-                exif[kCGImagePropertyExifUserComment] = text
-                properties[kCGImagePropertyExifDictionary] = exif
-            }
-        }
-        properties[kCGImageDestinationLossyCompressionQuality] = 0.95
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-        return CGImageDestinationFinalize(destination) ? nil : "Could not write the exported image."
     }
 }

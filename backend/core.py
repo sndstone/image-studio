@@ -49,13 +49,28 @@ def verify_png(path: Path):
         return image.size
 
 
-def save_png(image, path: Path):
+def save_file(data: bytes, path: Path):
+    """Writes a finished file as it is (a provider's GIF or SVG), published atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def save_png(image, path: Path, pnginfo=None):
     """Fast lossless Pillow save, verified before atomic publication."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            image.save(stream, format="PNG", compress_level=6, optimize=False)  # level 1 measured no faster here but ~45% larger
+            extra = {"pnginfo": pnginfo} if pnginfo is not None else {}
+            image.save(stream, format="PNG", compress_level=6, optimize=False, **extra)  # level 1 measured no faster here but ~45% larger
         size = verify_png(Path(temp))
         os.replace(temp, path)
         return size

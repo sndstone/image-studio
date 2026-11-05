@@ -38,16 +38,20 @@ if "IMAGE_STUDIO_HF_TOKEN" in os.environ:
     os.environ["HF_TOKEN"] = os.environ["IMAGE_STUDIO_HF_TOKEN"]
 
 import catalog
+import cloud
+import costs
 import optimized
 from core import (DiskSpaceError, assert_mlx_thread, atomic_json, memory_snapshot, preflight_memory, total_memory,
-                  require_disk, save_png, unique_path, verify_png)
+                  require_disk, save_file, save_png, unique_path, verify_png)
 from performance import materialize
 import storage
 import timings
-from downloads import DownloadManager, disk_usage, shared_with, local_models_using, _repo_dir
+from downloads import (DownloadManager, disk_usage, fetch_missing_manifests, local_models_using, missing_bytes,
+                       shared_with, unique_sources, _repo_dir)
 from gguf_convert import staging_folders
 from mflux.utils.exceptions import StopImageGenerationException
 
+COMPARE_HEADROOM_BYTES = 4 * 1024**3
 OUTPUT_ROOT = Path(os.environ.get("IMAGE_STUDIO_OUTPUT", Path.home() / "Pictures/Image Studio"))
 REF_CACHE = catalog.APP_SUPPORT / "reference-cache"
 log = logging.getLogger("image-studio")
@@ -185,6 +189,28 @@ class GenerateRequest(BaseModel):
     mask_path: str | None = None
     auto_mask: str | None = None
     enhance_prompt: bool = False
+    keep_loaded: bool = False  # Compare: leave this model loaded for the next one when memory allows
+    # OpenAI
+    quality: str | None = None
+    complexity: str | None = None
+    output_format: str | None = None  # png (default) | gif | svg
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
+    gif_auto_size: bool = True
+    markup_path: str | None = None  # a transparent annotation layer over image 1
+
+
+class CloudBatchRequest(BaseModel):
+    requests: list[GenerateRequest]
+
+
+class ComparePlanRequest(BaseModel):
+    models: list[str]
+    width: int = 1024
+    height: int = 1024
+    quantize: int | None = None
+    quality: str | None = None
+    complexity: str | None = None
 
 
 class UpscaleRequest(BaseModel):
@@ -211,6 +237,15 @@ class SettingsRequest(BaseModel):
     offline: bool | None = None
 
 
+class CloudKeyRequest(BaseModel):
+    provider: str
+    key: str | None = None
+
+
+class CloudTestRequest(BaseModel):
+    provider: str
+
+
 class PressureRequest(BaseModel):
     level: str
 
@@ -223,6 +258,10 @@ class LoadRequest(BaseModel):
 
 class OptimizeRequest(BaseModel):
     quantize: int
+
+
+class DownloadManyRequest(BaseModel):
+    ids: list[str]
 
 
 class DeleteRequest(BaseModel):
@@ -251,6 +290,9 @@ class State:
         self.cache_limit = None
         self.job_low_memory = False
         self.pipeline: catalog.Pipeline | None = None
+        self.parked = {}  # other loaded models during a comparison, by model key (see _load)
+        self.images_lock = threading.Lock()
+        self.reference_cache_stale = False  # images were removed during a job (see forget_removed_images)
         self.model_key = None
         self.phase = "idle"  # idle | loading | encoding | denoising | decoding | saving
         self.message = "Ready"
@@ -351,6 +393,9 @@ def _release():
         # Settle pressure/cache policy while we still own the operation lock.
         on_mlx(_handle_idle_pressure)
     finally:
+        if state.reference_cache_stale:
+            state.reference_cache_stale = False
+            shutil.rmtree(REF_CACHE, ignore_errors=True)
         state.busy = None
         state.lock.release()
 
@@ -514,8 +559,7 @@ class ProgressCallback:
         schedulers take Euler steps x' = x + (s' - s) * v, so v and then x0 = x' - s' * v follow from two
         consecutive latents."""
         assert_mlx_thread()
-        sigmas = getattr(config.scheduler, "sigmas", None)
-        sigmas = sigmas() if callable(sigmas) else sigmas
+        sigmas = catalog.Pipeline.schedule(state.pipeline, config)
         if prev is None or sigmas is None or t + 1 >= len(sigmas) or prev.shape != latents.shape:
             return latents
         s_now, s_next = float(sigmas[t].item()), float(sigmas[t + 1].item())
@@ -582,6 +626,8 @@ def _unload(*, cleanup=True) -> None:
     state.encoder_evicted = False
     _clear_job_references(state.pipeline)
     with state.model_status_lock:
+        state.parked.clear()
+    with state.model_status_lock:
         state.model_key = None
         state.pipeline = None
     if cleanup:
@@ -601,14 +647,44 @@ def _conversion_progress(done: int, total: int) -> None:
     state.step, state.total_steps = done, total
 
 
+def _fits_alongside(spec, quant, loaded_bytes=0) -> bool:
+    """Whether a further model fits in free memory, leaving room for other apps: only then stay loaded."""
+    snapshot = memory_snapshot()
+    free = snapshot.get("free_bytes")
+    if free is None or snapshot["pressure"] != "ok" or _pressure_level() != "normal":
+        return False
+    needed = _memory_gb(spec).get(str(quant or 0))
+    return needed is not None and needed * 1e9 + loaded_bytes + COMPARE_HEADROOM_BYTES <= free
+
+
+def _park_current() -> None:
+    """Keeps the current model in memory, not in use. One that freed its encoder can't run again as it is."""
+    if state.pipeline is None:
+        return
+    if state.encoder_evicted:
+        _unload()
+        return
+    _clear_job_references(state.pipeline)
+    with state.model_status_lock:
+        state.parked[state.model_key] = state.pipeline
+        state.pipeline, state.model_key = None, None
+
+
 def _load(spec: catalog.ModelSpec, quantize: int | None, lora: str | None, lora_scale: float,
-          loras=None) -> catalog.Pipeline:
+          loras=None, keep_loaded: bool = False) -> catalog.Pipeline:
     assert_mlx_thread()
     _apply_memory_policy()
     q = _quant(spec, quantize)
     adapters = loras or ([{"path": lora, "scale": lora_scale}] if lora else [])
     key = _model_key(spec, q, adapters)
     if state.pipeline is not None and state.model_key == key:
+        return state.pipeline
+    if key in state.parked:
+        _park_current()
+        with state.model_status_lock:
+            state.pipeline, state.model_key = state.parked.pop(key), key
+        state.auto_unloaded = False
+        state.last_activity = time.time()
         return state.pipeline
     checkpoint = optimized.usable(spec, q)
     checked_spec = _adapter_spec(spec) if checkpoint else spec
@@ -617,7 +693,10 @@ def _load(spec: catalog.ModelSpec, quantize: int | None, lora: str | None, lora_
         raise HTTPException(409, f"{spec.name} is not downloaded yet. Download it in the Model Manager.")
     state.phase = "loading"
     state.message = f"Loading {spec.name}…"
-    _unload()
+    if keep_loaded and _fits_alongside(spec, q):
+        _park_current()
+    else:
+        _unload()
     state.converted = False
     state.preview_cost = 0.0  # preview decode cost depends on the model's VAE
     started = time.time()
@@ -681,6 +760,13 @@ def _loaded_snapshot():
 
 def _model_json(spec: catalog.ModelSpec, usage: dict[str, int], loaded_snapshot=None,
                 models=None, timing_data=None) -> dict:
+    if spec.cloud_provider:
+        # Nothing on disk or in memory; "downloaded" means ready to use, which here takes an API key.
+        ready = cloud.has_key(spec.cloud_provider)
+        return {**spec.to_json(), "memory_gb": {}, "memory_measured": [], "shared_with": [], "disk_bytes": 0,
+                "own_bytes": 0, "optimized": {}, "loaded": False, "loaded_quant": None,
+                "status": {"downloaded": ready, "downloading": False, "bytes_present": 0, "bytes_total": None,
+                           "error": None}}
     loaded_id, loaded_quant = _loaded_snapshot() if loaded_snapshot is None else loaded_snapshot
     data = spec.to_json()
     timing_data = timings._read() if timing_data is None else timing_data
@@ -767,7 +853,19 @@ def list_models():
     usage = disk_usage()
     models = catalog.all_models()
     timing_data = timings._read()
-    return [_model_json(spec, usage, loaded_snapshot, models, timing_data) for spec in models]
+    result = [_model_json(spec, usage, loaded_snapshot, models, timing_data) for spec in models]
+    # A grouped model's "Download All" size: the versions not on this Mac yet, shared files counted once.
+    groups = {}
+    for spec, data in zip(models, result):
+        if spec.group:
+            groups.setdefault(spec.group, []).append((spec, data))
+    for members in groups.values():
+        missing = [spec for spec, data in members
+                   if not data["status"].get("downloaded") and not data["status"].get("downloading")]
+        remaining = missing_bytes(unique_sources(missing)) if missing else 0
+        for _, data in members:
+            data["group_missing_bytes"] = remaining
+    return result
 
 
 def _spec(model_id: str) -> catalog.ModelSpec:
@@ -777,11 +875,34 @@ def _spec(model_id: str) -> catalog.ModelSpec:
     return spec
 
 
+@app.post("/models/sizes")
+def fetch_model_sizes():
+    """Look up the download size of models not downloaded yet (in the background)."""
+    if not state.offline:
+        threading.Thread(target=fetch_missing_manifests, args=(catalog.all_models(),), daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/models/download")
+def download_models(req: DownloadManyRequest):
+    """Downloads several models together (e.g. every version of one model)."""
+    if state.offline:
+        raise HTTPException(409, "Offline mode is on")
+    specs = [spec for spec in map(_spec, req.ids) if spec.sources]  # cloud models have none
+    try:
+        downloads.start_many(specs)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True}
+
+
 @app.post("/models/{model_id}/download")
 def download_model(model_id: str):
     if state.offline:
         raise HTTPException(409, "Offline mode is on")
     spec = _spec(model_id)
+    if spec.cloud_provider:
+        raise HTTPException(400, f"{spec.name} runs in the cloud; there is nothing to download.")
     if not spec.sources:
         raise HTTPException(400, "This model is a local folder; there is nothing to download.")
     try:
@@ -807,6 +928,8 @@ def _own_sources(spec, models=None):
 @app.post("/models/{model_id}/delete")
 def delete_model(model_id: str, req: DeleteRequest = DeleteRequest()):
     spec = _spec(model_id)
+    if spec.cloud_provider:
+        raise HTTPException(400, f"{spec.name} runs in the cloud; there is nothing to delete.")
     if req.scope not in ("all", "own"):
         raise HTTPException(400, "scope must be all or own")
     _acquire("cleanup")
@@ -852,6 +975,8 @@ def delete_model(model_id: str, req: DeleteRequest = DeleteRequest()):
 @app.post("/models/{model_id}/load")
 def load_model(model_id: str, req: LoadRequest):
     spec = _spec(model_id)
+    if spec.cloud_provider:
+        raise HTTPException(400, f"{spec.name} runs in the cloud; there is nothing to load.")
     _acquire("load")
     try:
         on_mlx(_load, spec, req.quantize, req.lora_path, req.lora_scale)
@@ -994,11 +1119,129 @@ def set_token(req: TokenRequest):
     return {"valid": True, "user": user, "gated_access": access}
 
 
+# --- cloud providers -----------------------------------------------------------------------------
+
+
+def _cloud_provider(name: str) -> str:
+    if name not in cloud.PROVIDERS:
+        raise HTTPException(400, f"Unknown provider {name}")
+    return name
+
+
+@app.post("/cloud/keys")
+def set_cloud_key(req: CloudKeyRequest):
+    """Sets (or clears) a provider's API key for this run of the engine; the app keeps it in the Keychain."""
+    cloud.set_key(_cloud_provider(req.provider), req.key)
+    return {"ok": True}
+
+
+@app.get("/cloud/costs")
+def cloud_costs():
+    return costs.summary()
+
+
+@app.post("/history/forget")
+def forget_removed_images():
+    """After images leave the library: their cost entries go, and so do any cached copies made from them as
+    references (a cache, rebuilt on demand, whose files can't be traced back; left alone while a job may use it)."""
+    costs.entries()
+    if state.lock.acquire(blocking=False):
+        state.busy = "cleanup"
+        try:
+            shutil.rmtree(REF_CACHE, ignore_errors=True)
+        finally:
+            _release()
+    else:
+        state.reference_cache_stale = True  # cleared when the running job releases the lock
+    return {"ok": True}
+
+
+@app.post("/compare/plan")
+def compare_plan(req: ComparePlanRequest):
+    """How a comparison would run, for the Compare window: the run itself checks memory again per model."""
+    specs = [_spec(model_id) for model_id in req.models]
+    local = [spec for spec in specs if not spec.cloud_provider and not spec.tool]
+    remote = [spec for spec in specs if spec.cloud_provider]
+    estimates = []
+    for spec in remote:
+        quality = (req.quality if req.quality in spec.cloud_qualities else "auto") if spec.cloud_qualities else None
+        complexity = req.complexity if spec.cloud_complexity else None
+        estimates.append(costs.estimate(spec.cloud_provider, spec.cloud_model, req.width, req.height, quality,
+                                        complexity=complexity, output_format=None, frame_count=None, gif_auto_size=None)[0])
+    keep_loaded, needed = False, 0
+    if len(local) >= 2:
+        keep_loaded = True
+        for spec in local:
+            quant = _quant(spec, req.quantize)
+            if not _fits_alongside(spec, quant, needed):
+                keep_loaded = False
+                break
+            needed += int(_memory_gb(spec).get(str(quant or 0), 0) * 1e9)
+    return {"cloud_models": len(remote), "local_models": len(local), "keep_loaded": keep_loaded,
+            "cost_usd": sum(cost for cost in estimates if cost is not None),
+            "costs_unknown": sum(cost is None for cost in estimates)}
+
+
+def _offline_result():
+    return {"ok": False, "message": "Offline mode is on. Turn it off in Settings → General to use cloud models."}
+
+
+@app.post("/cloud/test")
+def test_cloud_key(req: CloudTestRequest):
+    """A free, read-only check of the saved key."""
+    provider = _cloud_provider(req.provider)
+    if state.offline:
+        return _offline_result()
+    return cloud.verify(provider, [spec.cloud_model for spec in catalog.CLOUD_MODELS
+                                   if spec.cloud_provider == provider])
+
+
+@app.post("/cloud/test-image")
+def test_cloud_image(req: CloudTestRequest):
+    """One small, billed image, shown in Settings and not saved."""
+    provider = _cloud_provider(req.provider)
+    if state.offline:
+        return _offline_result()
+    return cloud.test_image(provider)
+
+
 # --- generation --------------------------------------------------------------------------------
 
 
 def _model_key(spec, quant, loras):
     return (spec.id, quant, tuple((item["path"], item["scale"]) for item in loras))
+
+
+def _openai_options(req: GenerateRequest, spec: catalog.ModelSpec, paths: list[str]) -> dict:
+    """The fields only GPT Image takes, checked against what this model does; empty for every other model."""
+    if spec.cloud_provider != "openai":
+        return {"quality": None, "complexity": None, "output_format": None, "frame_count": None,
+                "frame_duration_ms": None, "markup_path": None}
+    output_format = req.output_format or "png"
+    if output_format not in spec.cloud_formats:
+        raise HTTPException(400, f"{spec.name} can't make {output_format.upper()} output.")
+    if output_format != "png" and paths:
+        raise HTTPException(400, f"{output_format.upper()} output can't use reference images: OpenAI only edits into stills.")
+    quality = req.quality or "auto"
+    if quality not in spec.cloud_qualities:
+        raise HTTPException(400, f"{spec.name} doesn't offer {quality} quality.")
+    complexity = req.complexity if spec.cloud_complexity else None
+    if complexity is not None and complexity not in cloud.OPENAI_COMPLEXITIES:
+        raise HTTPException(400, "complexity must be low, medium or high")
+    if req.markup_path is not None and not spec.supports_markup:
+        raise HTTPException(400, f"{spec.name} doesn't support markup.")
+    if req.markup_path is not None and not paths:
+        raise HTTPException(400, "Markup needs a reference image to draw on.")
+    frames, duration = None, None
+    if output_format == "gif":
+        frames = 9 if req.frame_count is None else req.frame_count
+        duration = 200 if req.frame_duration_ms is None else req.frame_duration_ms
+        if not 2 <= frames <= 16:
+            raise HTTPException(400, "A GIF has 2 to 16 frames.")
+        if not 20 <= duration <= 2000:
+            raise HTTPException(400, "A GIF frame lasts 20 to 2000 ms.")
+    return {"quality": quality, "complexity": complexity, "output_format": output_format, "frame_count": frames,
+            "frame_duration_ms": duration, "markup_path": req.markup_path}
 
 
 def normalize_request(req: GenerateRequest, require_prompt: bool = True):
@@ -1029,12 +1272,13 @@ def normalize_request(req: GenerateRequest, require_prompt: bool = True):
             raise HTTPException(400, "Mask description is empty")
     if req.enhance_prompt and spec.supports_enhance and not paths:
         raise HTTPException(400, "Prompt enhancement needs at least one reference image")
-    loras = [item.model_dump() for item in req.loras]
-    if not loras and req.lora_path:
+    loras = [] if spec.cloud_provider else [item.model_dump() for item in req.loras]
+    if not loras and req.lora_path and not spec.cloud_provider:
         loras = [{"path": req.lora_path, "scale": req.lora_scale}]
     for item in loras:
         if not item["path"].strip() or not math.isfinite(item["scale"]):
             raise HTTPException(400, "Each LoRA needs a path and a finite scale")
+    openai_options = _openai_options(req, spec, paths)
     strength = spec.default_strength if req.strength is None else req.strength
     if paths and (mode == "init" or spec.family in ("zimage", "krea2")):
         strength = max(0.05, strength)
@@ -1052,6 +1296,7 @@ def normalize_request(req: GenerateRequest, require_prompt: bool = True):
         "fast": req.fast and spec.supports_step_cache,
         "enhance_prompt": req.enhance_prompt and spec.supports_enhance,
         "negative_prompt": req.negative_prompt if spec.supports_negative and spec.passes_per_step(guidance) > 1 else None,
+        **openai_options,
     })
     return normalized, spec, paths
 
@@ -1059,12 +1304,17 @@ def normalize_request(req: GenerateRequest, require_prompt: bool = True):
 @app.post("/estimate")
 def estimate(req: EstimateRequest):
     req, spec, paths = normalize_request(req, require_prompt=False)  # asked before a prompt is typed
+    if spec.cloud_provider:
+        cost, basis = costs.estimate(spec.cloud_provider, spec.cloud_model, *_cost_size(req), req.quality,
+                                     **_cost_options(req))
+        return {"seconds": None, "load_seconds": 0, "basis": "none", "steps_run": req.steps, "passes": 1,
+                "cost_usd": cost, "cost_basis": basis}
     kind = timings.kind_of(paths, req.image_mode)
     passes = spec.passes_per_step(req.guidance)
     run = timings.steps_run(spec, req.steps, req.strength, kind)
     key = _model_key(spec, _quant(spec, req.quantize), [item.model_dump() for item in req.loras])
     result = timings.estimate(spec.id, _quant(spec, req.quantize), kind, run, passes,
-                              req.width * req.height / 1e6, len(paths), req.count, needs_load=state.model_key != key)
+                              req.width * req.height / 1e6, len(paths), req.count, needs_load=state.model_key != key and key not in state.parked)
     return {**result, "steps_run": run, "passes": passes}
 
 
@@ -1092,6 +1342,8 @@ def _memory_gb(spec: catalog.ModelSpec, megapixels: float = 1.0, kind: str | Non
 @app.post("/preflight")
 def preflight(req: GenerateRequest):
     req, spec, paths = normalize_request(req)
+    if spec.cloud_provider:  # runs elsewhere: this Mac's memory doesn't matter
+        return {"level": "ok", "message": "Memory looks sufficient.", "suggest_quant": None}
     return _preflight(req, spec, paths)
 
 
@@ -1170,11 +1422,60 @@ def _check_input(path):
         raise HTTPException(400, f"Input image not found: {path}")
 
 
+def _require_cloud(spec) -> None:
+    if state.offline:
+        raise HTTPException(400, f"{spec.name} runs in the cloud, and offline mode is on.")
+    if not cloud.has_key(spec.cloud_provider):
+        raise HTTPException(400, f"{spec.name} needs a {cloud.PROVIDERS[spec.cloud_provider]} API key. "
+                                 "Add one in Settings → Cloud.")
+
+
+@app.post("/generate/cloud-batch")
+def generate_cloud_batch(batch: CloudBatchRequest):
+    """Runs several cloud models at the same time (Compare). Each reports its own images or error."""
+    jobs = [normalize_request(req) for req in batch.requests]
+    for req, spec, paths in jobs:
+        if not spec.cloud_provider:
+            raise HTTPException(400, f"{spec.name} isn't a cloud model.")
+        _require_cloud(spec)
+        for path in [*paths, *([req.markup_path] if req.markup_path is not None else [])]:
+            _check_input(path)
+    _acquire("generate")
+    started = time.time()
+    try:
+        state.cancel.clear()
+        state.images_done = []
+        state.preview = None
+        state.image_index, state.image_count = 1, sum(req.count for req, _, _ in jobs)
+        state.step, state.total_steps = 0, 1
+        state.passes = 1
+        state.phase, state.message = "cloud", "Preparing reference images…"
+        prepared = []
+        for _, spec, paths in jobs:  # one at a time: the same image is shared, and its cache isn't thread-safe
+            _check_cancel()
+            prepared.append([_prepare_reference(path, spec.max_megapixels) for path in paths])
+        state.message = f"Waiting for {len(jobs)} cloud model{'' if len(jobs) == 1 else 's'}…"
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(jobs)))) as pool:
+            futures = [pool.submit(_generate_cloud, req, spec, paths, True)
+                       for (req, spec, _), paths in zip(jobs, prepared)]
+            results = [{"model": req.model, **future.result()} for (req, _, _), future in zip(jobs, futures)]
+        # "images" in the order they finished, which is the order the app showed them arriving in.
+        return {"results": results, "images": list(state.images_done), "cancelled": state.cancel.is_set(),
+                "seconds": round(time.time() - started, 1)}
+    except StopImageGenerationException:
+        return {"results": [], "images": [], "cancelled": True, "seconds": round(time.time() - started, 1)}
+    finally:
+        state.phase, state.message = "idle", "Ready"
+        _release()
+
+
 @app.post("/generate")
 def generate(req: GenerateRequest):
     req, spec, paths = normalize_request(req)
-    for path in [*paths, *([req.mask_path] if req.mask_path is not None else [])]:
+    for path in [*paths, *[p for p in (req.mask_path, req.markup_path) if p is not None]]:
         _check_input(path)
+    if spec.cloud_provider:
+        _require_cloud(spec)
     _acquire("generate")
     started = time.time()
     try:
@@ -1184,6 +1485,14 @@ def generate(req: GenerateRequest):
         state.image_index, state.image_count = 0, req.count
         state.step, state.total_steps = 0, req.steps
         state.passes = spec.passes_per_step(req.guidance)
+        if spec.cloud_provider:
+            state.phase, state.message = "cloud", "Preparing reference images…"
+            prepared = []
+            for path in paths:
+                _check_cancel()
+                prepared.append(_prepare_reference(path, spec.max_megapixels))
+            _check_cancel()
+            return _generate_cloud(req, spec, prepared)
         warning = _preflight(req, spec, paths)
         state.job_low_memory = warning["level"] != "ok"
         state.memory_warning = warning["message"] if warning["level"] != "ok" else None
@@ -1215,8 +1524,8 @@ def _sidecar(req, spec, pipeline, seed, elapsed):
         "quantize": quant, "guidance": req.guidance, "steps": req.steps, "strength": req.strength,
         "width": req.width, "height": req.height,
         "builtin_loras": [{"repo": repo, "filename": name, "scale": 1.0} for repo, name in spec.builtin_loras],
-        "scheduler": spec.scheduler or {"flux2": "flow_match_euler_discrete", "qwen21": "linear",
-                                        "zimage": "linear", "krea2": "er_sde"}.get(spec.family),
+        "scheduler": spec.scheduler or {"flux2": "flow_match_euler_discrete", "flux3": "flow_map",
+                                        "qwen21": "linear", "zimage": "linear", "krea2": "er_sde"}.get(spec.family),
         "mflux_version": optimized.mflux_version(), "revision": optimized.base_snapshot(spec),
     }
     return data
@@ -1263,7 +1572,7 @@ def _generate(req: GenerateRequest, spec: catalog.ModelSpec, image_paths: list[s
     started = time.time()
     try:
         _check_cancel()
-        pipeline = _load(spec, req.quantize, None, 1.0, [item.model_dump() for item in req.loras])
+        pipeline = _load(spec, req.quantize, None, 1.0, [item.model_dump() for item in req.loras], req.keep_loaded)
         if hasattr(pipeline, "begin_job"):
             pipeline.begin_job(image_paths)
         _check_cancel()
@@ -1325,6 +1634,139 @@ def _generate(req: GenerateRequest, spec: catalog.ModelSpec, image_paths: list[s
         _finish_job()
     return {"images": results, "cancelled": state.cancel.is_set(),
             "seconds": round(time.time() - started, 1), "error": error}
+
+
+def _generate_cloud(req: GenerateRequest, spec: catalog.ModelSpec, image_paths: list[str], in_batch: bool = False) -> dict:
+    """Same results and files as a local run. One request per image, so Cancel and failures stop the billing.
+    Never raises: in a batch, the other models' finished images must survive this one's failure."""
+    provider = cloud.PROVIDERS[spec.cloud_provider]
+    results, error = [], None
+    started = time.time()
+    try:
+        base_seed = req.seed if req.seed is not None else random.randint(0, 2**31 - 1)
+        out_dir = OUTPUT_ROOT / datetime.now().strftime("%Y-%m-%d")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        job = cloud.Job(model=spec.cloud_model, prompt=req.prompt, width=req.width, height=req.height,
+                        image_paths=image_paths, steps=req.steps if not spec.fixed_steps else None,
+                        guidance=req.guidance if spec.supports_guidance else None, quality=req.quality,
+                        complexity=req.complexity, output_format=req.output_format or "png",
+                        frame_count=req.frame_count, frame_duration_ms=req.frame_duration_ms,
+                        gif_auto_size=req.gif_auto_size, markup_path=req.markup_path)
+        for i in range(req.count):
+            _check_cancel()
+            seed = base_seed + i
+            if not in_batch:
+                state.image_index = i + 1
+                state.phase, state.message = "cloud", f"Waiting for {provider}…"
+            t0 = time.time()
+            job.seed = seed if spec.supports_seed else None
+            data, details = cloud.generate(spec.cloud_provider, job, state.cancel.is_set)
+            # The provider has charged for this image by now, so it's kept even if the job was cancelled meanwhile.
+            cancelled = state.cancel.is_set()
+            if not in_batch:
+                state.phase = "saving"
+            saved = None
+            size = None
+            try:
+                if job.output_format == "png":
+                    image = cloud.decode(data)
+                    size = image.size
+                    saved = _save_cloud_image(image, req, spec, seed, details, out_dir, time.time() - t0)
+                else:
+                    size = cloud.file_size(data, job.output_format)
+                    saved = _save_cloud_file(data, size, req, spec, seed, details, out_dir, time.time() - t0)
+            finally:
+                _record_charge(spec, req, job, details, saved, size)
+            item = {"path": str(saved), "seed": seed, "seconds": round(time.time() - t0, 1)}
+            results.append(item)
+            with state.images_lock:
+                state.images_done = [*state.images_done, item]
+                if in_batch:
+                    state.image_index = min(state.image_count, len(state.images_done) + 1)
+            if cancelled:
+                break
+    except (cloud.Cancelled, StopImageGenerationException):
+        state.cancel.set()
+    except cloud.CloudError as e:
+        error = str(e)
+    except Exception as e:
+        log.error("Cloud generation with %s failed: %s", spec.id, type(e).__name__)
+        error = f"Generation failed: {_friendly_error(e)}"
+    return {"images": results, "cancelled": state.cancel.is_set(),
+            "seconds": round(time.time() - started, 1), "error": error}
+
+
+def _save_cloud_image(image, req, spec, seed, details, out_dir, elapsed) -> Path:
+    from PIL.PngImagePlugin import PngInfo
+
+    path = _cloud_path(req, spec, seed, out_dir)
+    pnginfo = None
+    if state.embed_metadata:
+        pnginfo = PngInfo()
+        pnginfo.add_text("prompt", req.prompt)
+        pnginfo.add_text("model", spec.cloud_model)
+    save_png(image, path, pnginfo)
+    _save_cloud_sidecar(path, image.size, req, spec, seed, details, elapsed)
+    return path
+
+
+def _save_cloud_file(data, size, req, spec, seed, details, out_dir, elapsed) -> Path:
+    """A GIF or SVG, byte for byte: re-encoding would only lose quality or the vectors."""
+    path = _cloud_path(req, spec, seed, out_dir)
+    save_file(data, path)
+    _save_cloud_sidecar(path, size, req, spec, seed, details, elapsed)
+    return path
+
+
+def _cloud_path(req, spec, seed, out_dir) -> Path:
+    # With the model in the name: Compare runs several at once with one seed.
+    return unique_path(out_dir / f"{datetime.now().strftime('%H%M%S')}_{seed}_{spec.cloud_model}.{req.output_format or 'png'}")
+
+
+def _save_cloud_sidecar(path, size, req, spec, seed, details, elapsed) -> None:
+    """The image is saved and paid for by now: losing its settings mustn't fail the job and bill a retry."""
+    width, height = size or (req.width, req.height)  # an SVG needn't state a size
+    try:
+        atomic_json(path.with_suffix(".json"), {
+            **req.model_dump(), "quantize": 0, "seed": seed, "seconds": round(elapsed, 1),
+            "width": width, "height": height,
+            "cost_usd": details.get("cost_usd"), "cost_basis": details.get("cost_basis"),
+            "effective": {"cloud_provider": spec.cloud_provider, "cloud_model": spec.cloud_model,
+                          "seed_used": spec.supports_seed, "guidance": req.guidance, "steps": req.steps,
+                          "requested_width": req.width, "requested_height": req.height,
+                          "width": width, "height": height, **details}})
+    except OSError as e:
+        log.error("Could not save an image's settings: %s", type(e).__name__)
+
+
+def _cost_options(req) -> dict:
+    """The ledger fields, besides model, size and quality, that change an image's price. A still has no format here,
+    so that it matches entries from before GIFs existed."""
+    gif = req.output_format == "gif"
+    return {"output_format": req.output_format if req.output_format not in (None, "png") else None,
+            "frame_count": req.frame_count, "complexity": req.complexity,
+            "gif_auto_size": req.gif_auto_size if gif else None}
+
+
+def _cost_size(req) -> tuple[int, int]:
+    """The size that sets the price. When OpenAI chooses it, the editor's size says nothing, so all such runs compare."""
+    if req.output_format == "svg" or (req.output_format == "gif" and req.gif_auto_size):
+        return 1000, 1000
+    return req.width, req.height
+
+
+def _record_charge(spec, req, job, details, path, size) -> None:
+    """The ledger lists the images in the library, so one that couldn't be saved has no entry.
+    A full disk here mustn't turn an image that was generated and saved into a failed job, retried and billed again."""
+    if path is None:
+        return
+    try:
+        costs.record(provider=spec.cloud_provider, model=spec.cloud_model, kind="generate",
+                     cost_usd=details.get("cost_usd"), cost_basis=details.get("cost_basis"), prompt=req.prompt[:200],
+                     width=size[0] if size else None, height=size[1] if size else None,
+                     megapixels=_cost_size(req)[0] * _cost_size(req)[1] / 1e6, quality=job.quality, path=str(path), **_cost_options(req))
+    except OSError as e:
+        log.error("Could not record the cost of an image: %s", type(e).__name__)
 
 
 def _busy_repos() -> set[str]:
@@ -1470,4 +1912,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=7861)
     args = parser.parse_args()
     threading.Thread(target=_exit_when_parent_dies, args=(os.getppid(),), daemon=True).start()
+    # Images removed in Finder while the app was closed: their entries, and any cached copies (untraceable to them).
+    costs.entries()
+    shutil.rmtree(REF_CACHE, ignore_errors=True)
     _serve(args.port)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import stat
 from pathlib import Path
 
 from huggingface_hub import scan_cache_dir
@@ -21,9 +22,15 @@ REF_CACHE = catalog.APP_SUPPORT / "reference-cache"
 
 
 def _size(path: Path) -> int:
-    if path.is_file():
-        return path.stat().st_size
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file() and not f.is_symlink())
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 0  # Downloads and cleanup can remove files during a scan.
+    if stat.S_ISREG(info.st_mode):
+        return info.st_size
+    if stat.S_ISDIR(info.st_mode):
+        return optimized.disk_bytes(path)
+    return 0
 
 
 def _item(id: str, category: str, label: str, detail: str, size: int, recommended: bool, paths=(), repo=None):
@@ -31,8 +38,8 @@ def _item(id: str, category: str, label: str, detail: str, size: int, recommende
             "recommended": recommended, "_paths": [str(p) for p in paths], "_repo": repo}
 
 
-def _used_repos() -> set[str]:
-    return {s.repo for spec in catalog.all_models() for s in spec.sources}
+def _used_repos(models=None) -> set[str]:
+    return {s.repo for spec in (catalog.all_models() if models is None else models) for s in spec.sources}
 
 
 def _converted_ok(spec: catalog.ModelSpec, folder: Path) -> bool:
@@ -59,7 +66,7 @@ def scan(keep: set[str], busy_repos: set[str], protected: set[str] = frozenset()
         if partial and repo not in busy_repos and not _inside(repo_dir, protected):
             items.append(_item(f"partial:{repo}", "Unfinished downloads", repo,
                                "Left over from a cancelled or failed download; downloading again restarts it.",
-                               sum(p.stat().st_size for p in partial), True, partial))
+                               sum(_size(p) for p in partial), True, partial))
 
     models = {spec.id: spec for spec in catalog.all_models()}
     valid_optimized_ids = set()
@@ -83,7 +90,7 @@ def scan(keep: set[str], busy_repos: set[str], protected: set[str] = frozenset()
                                "Outdated optimized copy", _size(folder), True, [folder]))
 
     # One-time GGUF conversions that are outdated, orphaned or half-written.
-    specs = {spec.id: spec for spec in catalog.all_models() if spec.gguf}
+    specs = {spec.id: spec for spec in models.values() if spec.gguf}
     for folder in sorted(catalog.CONVERTED_DIR.iterdir()) if catalog.CONVERTED_DIR.exists() else []:
         if not folder.is_dir() or _inside(folder, protected):
             continue
@@ -107,18 +114,19 @@ def scan(keep: set[str], busy_repos: set[str], protected: set[str] = frozenset()
             continue
         items.append(_item(f"converted:{name}", "Converted models", name, detail, _size(folder), True, [folder]))
 
-    if REF_CACHE.exists() and any(REF_CACHE.iterdir()):
+    if REF_CACHE.exists() and not _inside(REF_CACHE, protected) and any(REF_CACHE.iterdir()):
         items.append(_item("refcache", "Caches", "Converted input images",
                            "HEIC and rotated photos converted for the models; recreated when needed.",
                            _size(REF_CACHE), True, [REF_CACHE]))
 
     if DROPPED_DIR.exists():
-        unused = [f for f in DROPPED_DIR.iterdir() if f.is_file() and str(f) not in keep]
+        unused = [f for f in DROPPED_DIR.iterdir()
+                  if f.is_file() and str(f) not in keep and not _inside(f, protected)]
         if unused:
             items.append(_item("dropped", "Caches", "Images dragged in from other apps",
                                f"{len(unused)} copies of images dropped from browsers or other apps; images "
                                "currently in your reference list are kept.",
-                               sum(f.stat().st_size for f in unused), True, unused))
+                               sum(_size(f) for f in unused), True, unused))
 
     active_logs = running_logs()
     logs = [p for p in [catalog.APP_SUPPORT / "server.previous.log", *catalog.APP_SUPPORT.glob("download-*.log")]
@@ -126,11 +134,11 @@ def scan(keep: set[str], busy_repos: set[str], protected: set[str] = frozenset()
             and not (busy_repos and p.name.startswith("download-"))]
     if logs:
         items.append(_item("logs", "Logs", "Old logs", "Engine and download logs from earlier sessions.",
-                           sum(p.stat().st_size for p in logs), True, logs))
+                           sum(_size(p) for p in logs), True, logs))
 
     # Hugging Face cache repos that no Image Studio model uses. Other apps share this cache, so these
     # are listed but not recommended.
-    used = _used_repos()
+    used = _used_repos(models.values())
     try:
         repos = [r for r in scan_cache_dir().repos if r.repo_type == "model" and r.repo_id not in used]
     except Exception:

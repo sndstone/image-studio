@@ -7,31 +7,31 @@ struct CompareSheet: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var chosen: Set<String> = []
+    @State private var plan: ComparePlan?
 
     private var candidates: [ModelInfo] { model.models.filter { $0.status.downloaded && !$0.isTool } }
+    private var local: [ModelInfo] { candidates.filter { !$0.isCloud } }
+    private var cloud: [ModelInfo] { candidates.filter(\.isCloud) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Compare Models").font(.title3.bold())
-            Text("Runs your prompt\(model.references.isEmpty ? "" : ", images") and size on each model with the same seed, "
-                 + "using each model's recommended steps and guidance. Results appear side by side.")
+            Text("Runs your prompt\(model.references.isEmpty ? "" : ", images") and size on each model, using each model's "
+                 + "recommended settings. Results appear side by side.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            ForEach(candidates) { info in
-                Toggle(isOn: Binding(get: { chosen.contains(info.id) },
-                                     set: { if $0 { chosen.insert(info.id) } else { chosen.remove(info.id) } })) {
-                    HStack {
-                        Text(info.name)
-                        Spacer()
-                        Text("\(info.default_steps) steps").font(.caption).foregroundStyle(.secondary)
-                    }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    if !local.isEmpty { group("On this Mac", local) }
+                    if !cloud.isEmpty { group("Cloud", cloud) }
                 }
-                .toggleStyle(.checkbox)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxHeight: 340)
             if candidates.count < 2 {
-                Text("Download at least two models to compare them.").font(.caption).foregroundStyle(.orange)
+                StudioNote(.warning, "Download a model or add an API key: comparing takes at least two.")
             }
+            if chosen.count >= 2, let plan { planView(plan) }
             HStack {
-                Text("Models run one after another; switching models adds loading time.").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Compare \(chosen.count) Models") {
@@ -39,12 +39,68 @@ struct CompareSheet: View {
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 .disabled(chosen.count < 2)
             }
         }
         .padding(20)
-        .frame(width: 480)
-        .onAppear { chosen = [model.modelID] }
+        .frame(width: 520)
+        .onAppear {
+            if candidates.contains(where: { $0.id == model.modelID }) { chosen = [model.modelID] }
+            if let ids = ProcessInfo.processInfo.environment["IMAGE_STUDIO_TEST_COMPARE_CHOSEN"] { chosen = Set(ids.components(separatedBy: ",")) }  // UI tests
+        }
+        .task(id: chosen) {
+            guard chosen.count >= 2 else { plan = nil; return }
+            plan = try? await model.backend.comparePlan(models: Array(chosen), width: model.width, height: model.height, quantize: model.quantize,
+                                                        quality: model.openaiQuality, complexity: model.openaiComplexity)
+        }
+    }
+
+    private func group(_ title: String, _ models: [ModelInfo]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.subheadline.bold()).padding(.top, 4)
+            ForEach(models) { info in
+                Toggle(isOn: Binding(get: { chosen.contains(info.id) },
+                                     set: { if $0 { chosen.insert(info.id) } else { chosen.remove(info.id) } })) {
+                    HStack {
+                        Text(info.name)
+                        Spacer()
+                        if !info.isCloud { Text("\(info.default_steps) steps").font(.caption).foregroundStyle(.secondary) }
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .padding(.trailing, 12)
+            }
+        }
+    }
+
+    /// How the chosen models will run: the engine checks memory again when each one starts.
+    @ViewBuilder
+    private func planView(_ plan: ComparePlan) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if plan.cloud_models > 0 {
+                Label(plan.cloud_models == 1 ? "The cloud model runs first." : "\(plan.cloud_models) cloud models run at the same time, first.", systemImage: "cloud")
+            }
+            if plan.local_models == 1 {
+                Label("The local model runs on this Mac.", systemImage: "desktopcomputer")
+            } else if plan.local_models > 1 {
+                Label(plan.keep_loaded
+                      ? "\(plan.local_models) local models take turns. All fit in free memory, so they stay loaded and switching is instant."
+                      : "\(plan.local_models) local models take turns. They don't all fit in free memory, so each unloads before the next loads.",
+                      systemImage: "desktopcomputer")
+            }
+            if plan.cloud_models > 0 {
+                Label(costText(plan), systemImage: "dollarsign.circle")
+            }
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func costText(_ plan: ComparePlan) -> String {
+        if plan.costs_unknown == plan.cloud_models { return "Billed per image; the cost shows after the first run of these models." }
+        let more = plan.costs_unknown > 0 ? ", plus \(plan.costs_unknown) model\(plan.costs_unknown == 1 ? "" : "s") not priced yet" : ""
+        return "About \(formatUSD(plan.cost_usd))\(more)."
     }
 }
 
@@ -75,17 +131,17 @@ struct CompareGrid: View {
                 let columns = n <= 3 ? n : Int(Double(n).squareRoot().rounded(.up))
                 let rows = Int((Double(n) / Double(columns)).rounded(.up))
                 let side = min((geo.size.width - CGFloat(columns + 1) * 12) / CGFloat(columns),
-                               (geo.size.height - CGFloat(rows) * 34) / CGFloat(rows))
+                               (geo.size.height - CGFloat(rows) * 48) / CGFloat(rows))
                 ScrollView {
                 LazyVGrid(columns: Array(repeating: GridItem(.fixed(max(80, side)), spacing: 12), count: columns), spacing: 12) {
                     ForEach(items) { item in
                         VStack(spacing: 4) {
                             Thumbnail(url: item.url, maxPixels: 1024, revision: item, fit: true)
-                                .frame(width: max(80, side), height: max(80, side) - 22)
+                                .frame(width: max(80, side), height: max(80, side) - 36)
                                 .onTapGesture(count: 2) { model.selected = item; model.closeCompare() }
                                 .contextMenu { ItemMenu(item: item) }
                                 .help("Double-click to open")
-                            Text(model.caption(for: item)).font(.caption).lineLimit(1)
+                            Text(model.caption(for: item)).font(.caption).lineLimit(2).multilineTextAlignment(.center)
                         }
                     }
                 }

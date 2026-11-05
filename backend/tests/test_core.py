@@ -62,9 +62,184 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(spec.supports_mask, spec.family == "qwen21")
                 self.assertEqual(spec.supports_enhance, spec.family == "qwen21")
                 self.assertEqual(spec.supports_step_cache, spec.family == "qwen21" and spec.default_steps == 40)
-                self.assertEqual(spec.optimizable, not spec.tool)
+                self.assertEqual(spec.optimizable, not spec.tool and spec.family != "flux3")
+                if spec.stored_quant is not None:
+                    self.assertEqual(spec.quant_options, [spec.stored_quant])
         self.assertEqual(catalog.get("flux2-klein-9b").max_megapixels, 1.6)
         self.assertEqual(catalog.get("krea-2-turbo").max_megapixels, 1.3)
+
+    def test_flux3_precisions_are_separate_downloads(self):
+        int8, int4, bf16 = (catalog.get(f"flux3-klein-{p}") for p in ("int8", "int4", "bf16"))
+        self.assertEqual([s.repo for s in int8.sources], [catalog.FLUX3_INT8_REPO])
+        self.assertEqual([s.repo for s in int4.sources], [catalog.FLUX3_INT4_REPO])
+        self.assertEqual([s.repo for s in bf16.sources], [catalog.FLUX3_BF16_REPO])
+        # Downloading or deleting one never touches the others' files.
+        for spec in (int8, int4, bf16):
+            self.assertEqual(downloads.shared_with(spec), [])
+            self.assertEqual(server._own_sources(spec), spec.sources)
+        self.assertEqual((int8.stored_quant, int8.default_quant), (8, 8))
+        self.assertEqual((int4.stored_quant, int4.default_quant), (4, 4))
+        self.assertLess(int4.memory_gb["4"], int8.memory_gb["8"])
+        self.assertEqual((bf16.stored_quant, bf16.default_quant, bf16.quant_options), (None, 0, [0, 8, 4]))
+        req, _, _ = server.normalize_request(self.req(model="flux3-klein-int4", quantize=8))
+        self.assertEqual(req.quantize, 4)
+        for spec in (int8, int4, bf16):
+            self.assertFalse(spec.optimizable)
+            self.assertEqual(spec.to_json()["double_pass_when"], "never")
+        req, spec, paths = server.normalize_request(self.req(model="flux3-klein-int8", image_paths=["a.png"],
+                                                             image_mode="init", guidance=4, quantize=0))
+        self.assertEqual((req.image_mode, req.guidance, req.quantize, paths), ("init", 1.0, 8, ["a.png"]))
+        self.assertEqual((req.strength, spec.default_strength), (0.7, 0.7))
+        req, _, _ = server.normalize_request(self.req(model="flux3-klein-bf16", quantize=None))
+        self.assertEqual(req.quantize, 0)
+
+    def test_flux3_generate_routes_and_job_scoped_prompt_cache(self):
+        pipeline = catalog.Pipeline.__new__(catalog.Pipeline)
+        pipeline.spec = catalog.get("flux3-klein-int8")
+        calls = []
+        pipeline.model = types.SimpleNamespace(prompt_cache={"old": 1},
+                                               generate_image=lambda **kw: calls.append(("text", kw)))
+        pipeline.edit = types.SimpleNamespace(generate_image=lambda **kw: calls.append(("edit", kw)))
+        common = dict(seed=1, prompt="p", steps=16, width=512, height=512, guidance=3, strength=None,
+                      negative_prompt="n")
+        server.on_mlx(lambda: pipeline.generate(image_paths=[], **common))
+        server.on_mlx(lambda: pipeline.generate(image_paths=["a.png", "b.png"], **common))
+        pipeline._flux3_from_image = lambda **kw: calls.append(("init", kw))
+        server.on_mlx(lambda: pipeline.generate(image_paths=["a.png", "b.png"], image_mode="init", **common))
+        self.assertEqual([c[0] for c in calls], ["text", "edit", "init"])
+        self.assertEqual((calls[2][1]["image_path"], calls[2][1]["num_inference_steps"]), ("a.png", 16))
+        self.assertAlmostEqual(calls[2][1]["keep"], 0.3)  # default change 0.7
+        self.assertNotIn("guidance", calls[0][1])
+        self.assertNotIn("negative_prompt", calls[1][1])
+        self.assertEqual(calls[1][1]["image_paths"], ["a.png", "b.png"])
+        server.on_mlx(pipeline.end_job)
+        self.assertEqual(pipeline.model.prompt_cache, {})
+
+    def test_flux3_prompt_encodings_are_evaluated_when_made(self):
+        pipeline = catalog.Pipeline.__new__(catalog.Pipeline)
+        encoded = (FakeArray("tokens"), FakeArray("ids"))
+        pipeline.model = types.SimpleNamespace(_encode_prompt=lambda prompt: encoded)
+        pipeline.edit = types.SimpleNamespace(_encode_prompt=lambda prompt: encoded)
+        def evaluate(*arrays):
+            core.assert_mlx_thread()
+            for array in arrays:
+                array.evaluated = True
+        with patch.object(_fake_mx, "eval", side_effect=evaluate):
+            server.on_mlx(pipeline._evaluate_prompt_encodings)
+            server.on_mlx(lambda: pipeline.edit._encode_prompt("p"))
+        self.assertTrue(all(getattr(a, "evaluated", False) for a in encoded))
+
+    def test_flux3_loads_from_downloaded_snapshot(self):
+        spec = catalog.get("flux3-klein-bf16")
+        with patch.object(downloads, "HF_HUB_CACHE", str(self.root / "hub")):
+            with self.assertRaises(RuntimeError):
+                catalog.downloaded_folder(spec)
+            repo = downloads._repo_dir(spec.sources[0].repo)
+            (repo / "snapshots" / "abc").mkdir(parents=True)
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("abc")
+            self.assertEqual(catalog.downloaded_folder(spec), repo / "snapshots" / "abc")
+
+    def test_snapshot_follows_mflux_pinned_revision(self):
+        repo = "black-forest-labs/FLUX.2-klein-4B"
+        with patch.object(downloads, "HF_HUB_CACHE", str(self.root / "hub")):
+            folder = downloads._repo_dir(repo)
+            (folder / "snapshots" / "main-commit").mkdir(parents=True)
+            (folder / "refs").mkdir()
+            (folder / "refs" / "main").write_text("main-commit")
+            with patch.object(downloads, "_revision", return_value=None):
+                self.assertEqual(downloads._snapshot(repo), folder / "snapshots" / "main-commit")
+            with patch.object(downloads, "_revision", return_value="pinned"):
+                # Another commit's snapshot is not the model mflux will load.
+                self.assertIsNone(downloads._snapshot(repo))
+                (folder / "snapshots" / "pinned").mkdir()
+                self.assertEqual(downloads._snapshot(repo), folder / "snapshots" / "pinned")
+            with patch.object(downloads, "_revision", return_value="pinned"), \
+                 patch.object(downloads.subprocess, "Popen") as popen, \
+                 patch.object(downloads, "APP_SUPPORT", self.root):
+                downloads.DownloadJob("flux2-klein-4b", [catalog.Source(repo, ["*.json"])])
+            payload = json.loads(popen.call_args.args[0][-1])
+            self.assertEqual(payload[0]["revision"], "pinned")
+
+    def test_disk_check_counts_cached_blobs_of_a_new_revision(self):
+        repo = "org/model"
+        file = types.SimpleNamespace(path="transformer/0.safetensors", size=4,
+                                     lfs=types.SimpleNamespace(sha256="abc"), blob_id="git")
+        with patch.object(downloads, "HF_HUB_CACHE", str(self.root / "hub")), \
+             patch.object(downloads, "_revision", return_value="pinned"), \
+             patch.object(downloads.HfApi, "list_repo_tree", return_value=[file]):
+            self.assertEqual(downloads._reusable_bytes(repo, ["transformer/*"]), 0)
+            blobs = downloads._repo_dir(repo) / "blobs"
+            blobs.mkdir(parents=True)
+            (blobs / "abc").write_bytes(b"1234")  # same content under an earlier commit
+            self.assertEqual(downloads._reusable_bytes(repo, ["transformer/*"]), 4)
+            self.assertEqual(downloads._reusable_bytes(repo, ["vae/*"]), 0)
+
+    def test_manifest_falls_back_to_pre_pin_sizes(self):
+        repo, patterns = "org/model", ["*.safetensors"]
+        manifests = self.root / "manifests.json"
+        manifests.write_text(json.dumps({f"{repo}|*.safetensors": {"a.safetensors": 5}}))
+        with patch.object(downloads, "MANIFEST_FILE", manifests), \
+             patch.object(downloads, "_revision", return_value="pinned"):
+            self.assertEqual(downloads.manifest(repo, patterns, cached_only=True), {"a.safetensors": 5})
+            with patch.object(downloads.HfApi, "list_repo_tree", return_value=[
+                    types.SimpleNamespace(path="b.safetensors", size=7)]) as tree:
+                self.assertEqual(downloads.manifest(repo, patterns, refresh=True), {"b.safetensors": 7})
+                self.assertEqual(tree.call_args.kwargs["revision"], "pinned")
+            self.assertEqual(downloads.manifest(repo, patterns, cached_only=True), {"b.safetensors": 7})
+
+    def test_grouped_versions_share_a_card(self):
+        groups = {}
+        for spec in catalog.CATALOG:
+            if spec.group:
+                groups.setdefault(spec.group, []).append(spec)
+            else:
+                self.assertIsNone(spec.variant)
+        self.assertEqual([s.variant for s in groups["FLUX.3 klein"]], ["INT4", "INT8", "BF16"])
+        self.assertEqual([s.variant for s in groups["FLUX.2 klein"]], ["4B", "Base 4B", "9B"])
+        self.assertEqual([s.variant for s in groups["Qwen-Image 2.1"]],
+                         ["Turbo", "Full", "Uncensored Turbo", "Uncensored"])
+        for members in groups.values():
+            self.assertEqual(len({s.group_description for s in members}), 1)
+            self.assertTrue(members[0].group_description)
+            self.assertEqual(len({s.variant for s in members}), len(members))
+            self.assertEqual(len({s.family for s in members}), 1)
+            # A group's versions are listed together, so the picker and manager keep catalog order.
+            positions = [catalog.CATALOG.index(s) for s in members]
+            self.assertEqual(positions, list(range(positions[0], positions[0] + len(members))))
+        self.assertEqual(catalog.get("flux3-klein-int8").to_json()["variant"], "INT8")
+        custom = catalog._custom_spec({"architecture": "qwen-image-2.1", "path": "org/custom", "id": "c", "name": "C"})
+        self.assertEqual((custom.group, custom.variant, custom.group_description), (None, None, ""))
+
+    def test_download_all_fetches_shared_files_once(self):
+        specs = [s for s in catalog.CATALOG if s.group == "Qwen-Image 2.1"]
+        manager = downloads.DownloadManager()
+        launched = []
+        with patch.object(downloads, "manifest"), \
+             patch.object(downloads, "source_progress", return_value=(0, 10, False)), \
+             patch.object(downloads, "_reusable_bytes", return_value=0), \
+             patch.object(downloads, "HF_HUB_CACHE", str(self.root / "hub")), \
+             patch.object(manager, "_launch", side_effect=lambda owner, sources: launched.append((owner, sources))):
+            # Three repos (the base model and two LoRAs), 10 bytes each: the disk check counts each once.
+            self.assertEqual(downloads.missing_bytes(downloads.unique_sources(specs)), 30)
+            manager.start_many(specs)
+        repos = [s.repo for _, sources in launched for s in sources]
+        self.assertEqual(sorted(repos), sorted({s.repo for spec in specs for s in spec.sources}))
+        self.assertEqual([owner for owner, _ in launched], ["qwen-image-2.1-turbo", "qwen-image-2.1-uncensored-turbo"])
+        with patch.object(downloads, "source_progress", return_value=(0, None, False)):
+            self.assertIsNone(downloads.missing_bytes(downloads.unique_sources(specs)))
+
+    def test_missing_sizes_fetched_once_and_never_offline(self):
+        specs = [catalog.get("flux3-klein-int4"), catalog.get("flux3-klein-int8")]
+        with patch.object(downloads, "manifest", side_effect=lambda repo, patterns, cached_only=False:
+                          (None if cached_only and repo == catalog.FLUX3_INT4_REPO else {"x": 1})) as manifest:
+            self.assertEqual(downloads.fetch_missing_manifests(specs), 1)
+            fetched = [c.args[0] for c in manifest.call_args_list if not c.kwargs.get("cached_only")]
+            self.assertEqual(fetched, [catalog.FLUX3_INT4_REPO])
+            with patch.dict(os.environ, {"HF_HUB_OFFLINE": "1"}):
+                manifest.reset_mock()
+                self.assertEqual(downloads.fetch_missing_manifests(specs), 0)
+                manifest.assert_not_called()
 
     def test_custom_license(self):
         spec = catalog._custom_spec({"architecture": "flux2-klein-4b", "path": "/tmp/custom",

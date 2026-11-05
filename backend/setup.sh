@@ -2,7 +2,7 @@
 # Creates the Python runtime Image Studio uses. Safe to re-run.
 set -euo pipefail
 RUNTIME="${1:-$HOME/Library/Application Support/Image Studio}"
-RUNTIME_VERSION=3  # keep in sync with Backend.runtimeVersion
+RUNTIME_VERSION=4  # keep in sync with Backend.runtimeVersion
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 

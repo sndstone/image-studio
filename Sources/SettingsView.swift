@@ -7,35 +7,76 @@ struct SettingsView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Form {
-            Picker("Free the model's memory after", selection: $model.idleUnloadMinutes) {
-                Text("5 idle minutes").tag(5)
-                Text("10 idle minutes").tag(10)
-                Text("15 idle minutes").tag(15)
-                Text("30 idle minutes").tag(30)
-                Text("1 idle hour").tag(60)
-                Text("Never").tag(0)
-            }
-            Text(loadedModelMemory + " Unloading gives that memory back to other apps; the next "
-                 + "generation loads it again first (a few seconds to half a minute).")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Toggle("Embed prompt and settings in saved images", isOn: $model.embedMetadata)
-            Picker("Low-memory mode", selection: $model.lowMemory) {
-                Text("Automatic").tag("auto")
-                Text("Always").tag("always")
-                Text("Never").tag("never")
-            }
-            Toggle("Offline mode", isOn: $model.offline)
-            if let note = model.previewNote { Text(note).font(.caption).foregroundStyle(.orange) }
-            Toggle("Show a live preview while generating", isOn: $model.livePreview)
-            Text("Updates every few seconds so you can cancel a run that's going the wrong way. Previews are "
-                 + "low resolution and cost a few percent of the generation time.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        TabView(selection: $model.settingsTab) {
+            GeneralSettingsView().tabItem { Label("General", systemImage: "gearshape") }.tag("general")
+            CloudSettingsView().tabItem { Label("Cloud", systemImage: "cloud") }.tag("cloud")
+            HuggingFaceSettingsView().tabItem { Label("Hugging Face", systemImage: "key") }.tag("huggingface")
         }
-        .padding(20)
-        .frame(width: 440)
+        .scenePadding(.minimum)
+    }
+}
+
+/// A caption under a settings section: the explanation goes here so the controls stay one line each.
+private struct SettingsNote: View {
+    var text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+struct GeneralSettingsView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Unload idle model after", selection: $model.idleUnloadMinutes) {
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("Never").tag(0)
+                }
+                Picker("Low-memory mode", selection: $model.lowMemory) {
+                    Text("Automatic").tag("auto")
+                    Text("Always").tag("always")
+                    Text("Never").tag("never")
+                }
+            } header: {
+                Text("Memory")
+            } footer: {
+                SettingsNote(loadedModelMemory + " Unloading gives that memory back to other apps; the next image loads the model again first.")
+            }
+
+            Section {
+                Toggle("Live preview", isOn: $model.livePreview)
+                if let note = model.previewNote { Text(note).font(.caption).foregroundStyle(.orange) }
+            } header: {
+                Text("While generating")
+            } footer: {
+                SettingsNote("Updates every few seconds so you can cancel a run going the wrong way. Costs a few percent of the time. Local models only.")
+            }
+
+            Section {
+                Toggle("Embed prompt and settings", isOn: $model.embedMetadata)
+            } header: {
+                Text("Saved images")
+            } footer: {
+                SettingsNote("Writes them into each PNG, so they travel with the file. They're always kept beside the image in a settings file.")
+            }
+
+            Section {
+                Toggle("Offline mode", isOn: $model.offline)
+            } header: {
+                Text("Network")
+            } footer: {
+                SettingsNote("Stops Hugging Face downloads and cloud models. Local models you've already downloaded keep working.")
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 520, height: 590)
     }
 
     /// The engine's live figure rather than a fixed range, since it differs per model and precision.
@@ -46,3 +87,18 @@ struct SettingsView: View {
     }
 }
 
+struct HuggingFaceSettingsView: View {
+    var body: some View {
+        Form {
+            Section {
+                TokenView()
+            } header: {
+                Text("API key")
+            } footer: {
+                SettingsNote("Needed only to download gated models such as klein 9B.")
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 520, height: 300)
+    }
+}
